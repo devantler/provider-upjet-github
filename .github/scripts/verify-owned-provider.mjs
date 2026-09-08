@@ -33,6 +33,51 @@ const owner = (object, uid) => object.metadata?.ownerReferences?.some(r => r.uid
 const conditions = object => object.status?.conditions ?? [];
 const currentTrue = (object, type) => conditions(object).some(c => c.type === type && c.status === 'True' && c.observedGeneration === object.metadata.generation);
 const proof = (ok, message) => assert.ok(ok, `acceptance proof: ${message}`);
+export function parseRenderedObjects(output) {
+  const fail = ok => assert.ok(ok, 'invalid rendered JSON resource stream');
+  fail(typeof output === 'string' && output.length <= 32 * 1024 * 1024);
+  const whitespace = c => c === ' ' || c === '\t' || c === '\r' || c === '\n';
+  const objects = [];
+  let offset = 0;
+  // kubectl create prints one JSON document per resource, not a single List.
+  // Locate complete documents without splitting on braces inside JSON strings.
+  while (offset < output.length) {
+    while (whitespace(output[offset])) offset++;
+    if (offset === output.length) break;
+    fail(output[offset] === '{' && objects.length < 4096);
+    const start = offset;
+    let depth = 0; let quoted = false; let escaped = false;
+    for (; offset < output.length; offset++) {
+      const c = output[offset];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') quoted = false;
+      } else if (c === '"') quoted = true;
+      else if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') {
+        if (--depth === 0) { offset++; break; }
+      }
+    }
+    fail(depth === 0 && !quoted);
+    let object;
+    try { object = JSON.parse(output.slice(start, offset)); }
+    catch { throw new Error('invalid rendered JSON resource document'); } // Never quote private chart input.
+    fail(typeof object.apiVersion === 'string' && object.apiVersion.trim()
+      && typeof object.kind === 'string' && object.kind.trim() && object.kind !== 'List'
+      && !Object.hasOwn(object, 'items'));
+    objects.push(object);
+  }
+  fail(objects.length > 0);
+  return objects;
+}
+
+export function assertRenderedObjects(objects) {
+  proof(!objects.some(o => ['Provider', 'Function', 'Configuration', 'ManagedResourceActivationPolicy'].includes(o.kind)), 'unexpected bootstrap package or activation');
+  const images = objects.flatMap(o => [...(o.spec?.template?.spec?.containers ?? []), ...(o.spec?.template?.spec?.initContainers ?? [])].map(c => c.image));
+  proof(images.length >= 2 && images.every(image => image === CORE), 'unpinned Crossplane render');
+}
+
 export function assertBootstrap(s) {
   const check = (ok) => assert.ok(ok, 'bootstrap proof requires both owned ready runtimes and all pinned container identities');
   check(s.deployments.length === 2 && s.activations.length === 0 && s.pods.length === 2);
@@ -293,11 +338,8 @@ function runner(env) {
       const chart = path.join(tools, 'crossplane-2.4.0.tgz');
       const render = command('helm', ['template', 'crossplane', chart, '--namespace', 'crossplane-system', '--values', valuesPath]);
       // Read render via the real API client's local parser; no apply and no Secret output.
-      const rendered = JSON.parse(command('kubectl', ['create', '--dry-run=client', '--validate=false', '--kubeconfig', kubeconfig, '--context', context, '-f', '-', '-o', 'json'], { input: render, privateInput: true }));
-      const objects = rendered.items ?? [rendered];
-      proof(!objects.some(o => ['Provider', 'Function', 'Configuration', 'ManagedResourceActivationPolicy'].includes(o.kind)), 'unexpected bootstrap package or activation');
-      const images = objects.flatMap(o => [...(o.spec?.template?.spec?.containers ?? []), ...(o.spec?.template?.spec?.initContainers ?? [])].map(c => c.image));
-      proof(images.length >= 2 && images.every(image => image === CORE), 'unpinned Crossplane render');
+      const objects = parseRenderedObjects(command('kubectl', ['create', '--dry-run=client', '--validate=false', '--kubeconfig', kubeconfig, '--context', context, '-f', '-', '-o', 'json'], { input: render, privateInput: true }));
+      assertRenderedObjects(objects);
       command('helm', ['upgrade', '--install', 'crossplane', chart, '--namespace', 'crossplane-system', '--create-namespace', '--values', valuesPath,
         '--kubeconfig', kubeconfig, '--kube-context', context, '--wait', '--timeout', '5m'], { timeout: 330_000 });
       await until('crossplane', () => ({ deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),

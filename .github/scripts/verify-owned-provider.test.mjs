@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, runtimeEnvironment, assertBootstrap, finishResult } from './verify-owned-provider.mjs';
+import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects } from './verify-owned-provider.mjs';
 const inventory = JSON.parse(fs.readFileSync(new URL('./owned-provider-inventory.json', import.meta.url), 'utf8'));
 
 const image = 'ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8';
@@ -199,4 +199,67 @@ const corruptions = [
 for (const [name, change] of corruptions) test(`rejects false success: ${name}`, () => {
   const s = healthyFixture(image); change(s);
   assert.throws(() => assertHealthy(s, image, 3, healthyFixture()), /acceptance proof/);
+});
+
+// Captured from checksum-verified kubectl v1.36.4 (source bb826b1d48562f110659e64e8ec444327433db95).
+// The two ServiceAccounts come from the pinned Crossplane 2.4.0 chart. A credential-free local
+// discovery fixture answered only GET /api, /apis and /api/v1; no real cluster was contacted.
+// Native stdout SHA256: 66c0e83a1f40929efe208844fb1709db6b893994f814663bab2406870e099c63.
+test('parses every resource from actual kubectl 1.36.4 chart dry-run output', () => {
+  const output = fs.readFileSync(new URL('./fixtures/crossplane-serviceaccounts.kubectl-1.36.4.jsonstream', import.meta.url), 'utf8');
+  const expected = [JSON.parse(output.slice(0, 652)), JSON.parse(output.slice(652))];
+  assert.deepEqual(parseRenderedObjects(output), expected);
+  assert.deepEqual(expected.map(o => o.metadata.name), ['rbac-manager', 'crossplane']);
+});
+
+test('preserves quoted delimiters, escaped quotes, backslashes and nested JSON values', () => {
+  const object = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: 'nested' },
+    data: { text: 'quoted } ] { [ ' + String.fromCharCode(34, 92, 34, 92, 92) },
+    spec: { array: [null, true, false, 1.25e3, { child: ['}', '[', {}] }] } };
+  const next = { apiVersion: 'v1', kind: 'Namespace', metadata: { name: 'next' } };
+  const output = ' ' + JSON.stringify(object, null, 4) + String.fromCharCode(13, 10, 9) + JSON.stringify(next);
+  assert.deepEqual(parseRenderedObjects(output), [object, next]);
+});
+
+for (const bad of ['', '  ', '[]', 'null', 'true', '1', '"object"', '{}', '{"kind":"Pod"}', '{"apiVersion":"v1"}',
+  '{"apiVersion":"v1","kind":"Pod"', '{"apiVersion":"v1","kind":"Pod","spec":[}',
+  '{"apiVersion":"v1","kind":"Pod","spec":tru}', '{"apiVersion":"v1","kind":"Pod","data":{"x":"unterminated}}']) {
+  test('rejects incomplete, malformed or non-resource JSON: ' + bad.slice(0, 60), () => {
+    assert.throws(() => parseRenderedObjects(bad), /rendered JSON/);
+  });
+}
+
+test('rejects trailing garbage, malformed later documents and unexpected top-level values without partial success', () => {
+  const valid = JSON.stringify({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: 'valid' } });
+  for (const suffix of ['garbage', '[]', 'null', '{', '{"apiVersion":"v1","kind":"Pod"', '{}']) {
+    assert.throws(() => parseRenderedObjects(valid + String.fromCharCode(10) + suffix), /rendered JSON/);
+  }
+});
+
+test('rejects list wrappers and bounds document count and total input size', () => {
+  for (const kind of ['List', 'PodList']) {
+    assert.throws(() => parseRenderedObjects(JSON.stringify({ apiVersion: 'v1', kind, items: [] })), /rendered JSON/);
+  }
+  const valid = JSON.stringify({ apiVersion: 'v1', kind: 'Namespace', metadata: { name: 'valid' } });
+  assert.throws(() => parseRenderedObjects((valid + '\n').repeat(4097)), /rendered JSON/);
+  assert.throws(() => parseRenderedObjects(' '.repeat(32 * 1024 * 1024 + 1)), /rendered JSON/);
+});
+
+test('the unchanged render guards inspect later stream resources, including init container images', () => {
+  const output = fs.readFileSync(new URL('./fixtures/crossplane-serviceaccounts.kubectl-1.36.4.jsonstream', import.meta.url), 'utf8');
+  const image = 'xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b';
+  const runtime = { apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: 'crossplane' }, spec: { template: { spec: {
+    containers: [{ image }], initContainers: [{ image }],
+  } } } };
+  const rendered = output + JSON.stringify(runtime);
+  assert.doesNotThrow(() => assertRenderedObjects(parseRenderedObjects(rendered)));
+  assert.throws(() => assertRenderedObjects(parseRenderedObjects(output)), /unpinned Crossplane render/);
+  for (const kind of ['Provider', 'Function', 'Configuration', 'ManagedResourceActivationPolicy']) {
+    const extra = JSON.stringify({ apiVersion: 'pkg.crossplane.io/v1', kind, metadata: { name: 'unexpected' } });
+    assert.throws(() => assertRenderedObjects(parseRenderedObjects(rendered + '\n' + extra)), /unexpected bootstrap package or activation/);
+  }
+  for (const key of ['containers', 'initContainers']) {
+    const bad = structuredClone(runtime); bad.spec.template.spec[key][0].image = 'untrusted.example/runtime:latest';
+    assert.throws(() => assertRenderedObjects(parseRenderedObjects(rendered + '\n' + JSON.stringify(bad))), /unpinned Crossplane render/);
+  }
 });
