@@ -23,11 +23,18 @@ CLI 2.1.3, and native Linux runners. It does not alter generated CRDs or runtime
 source. Upstream's Dockerfile still resolves Alpine 3.23.4 and APK packages at
 build time: this is source provenance, not a claim of bit-for-bit reproducibility.
 
+Cosign 3.0.6 signs and verifies using its legacy signature format because
+Crossplane 2.4's native verifier reads that format. The workflow explicitly
+disables the newer bundle format and signing config for signing, and the newer
+bundle format for verification. Certificate identity and transparency-log
+verification remain enabled. The separate GitHub source attestation uses its
+modern bundle format and is independently verified with GitHub CLI.
+
 Before a production pin, independently verify the image's amd64/arm64 manifests,
 embedded CRDs and source parity, anonymous registry access, and both the Cosign
 signature and GitHub attestation. Require this exact workflow identity, its
 reviewed commit, and the upstream commit above. Check that the consuming verifier
-supports the Cosign 3 bundle format. Registry visibility and provider migration
+accepts the actual published signature. Registry visibility and provider migration
 or recovery behavior are separate acceptance checks; a successful upload does
 not establish either. This workflow does not change package visibility or any
 cluster configuration.
