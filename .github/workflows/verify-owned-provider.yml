@@ -1,0 +1,91 @@
+name: Verify owned provider acceptance and recovery
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: owned-provider-020-acceptance
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  acceptance:
+    if: github.repository == 'devantler/provider-upjet-github' && github.repository_id == '1278532211' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Check out the reviewed acceptance job
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test false-success refusals and enforce the execution boundary
+        run: |
+          node --test .github/scripts/verify-owned-provider.test.mjs
+          node .github/scripts/verify-owned-provider.mjs context
+      - name: Install pinned tools and the Crossplane chart
+        run: |
+          tools="${RUNNER_TEMP}/provider-acceptance-tools"
+          mkdir -m 700 "$tools"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/devantler-tech/ksail/releases/download/v7.183.1/ksail_7.183.1_linux_amd64.tar.gz \
+            --output "$tools/ksail.tgz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz --output "$tools/helm.tgz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://dl.k8s.io/release/v1.36.4/bin/linux/amd64/kubectl --output "$tools/kubectl"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://charts.crossplane.io/stable/crossplane-2.4.0.tgz --output "$tools/crossplane-2.4.0.tgz"
+          printf '%s  %s\n' \
+            6b3b101ada0a9ba38acb30a1b9782b73e3dee5ce8b511da0946671816654dc29 "$tools/ksail.tgz" \
+            a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496 "$tools/helm.tgz" \
+            8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a "$tools/kubectl" \
+            0900c2d1d01d22129abdedc3ad23621b66f87a87afb56649b95370d099ac70dd "$tools/crossplane-2.4.0.tgz" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "$tools/ksail.tgz" --directory "$tools" ksail
+          tar --extract --gzip --file "$tools/helm.tgz" --directory "$tools" --strip-components=1 linux-amd64/helm
+          chmod +x "$tools/ksail" "$tools/helm" "$tools/kubectl"
+      - name: Install the publisher-compatible Cosign verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Verify the exact published package before execution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image=ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8
+          publisher=47d0b77842d739a99b07f223fbbcf486ea800ea2
+          identity=https://github.com/devantler/provider-upjet-github/.github/workflows/publish-owned-provider.yml@refs/heads/main
+          mkdir -m 700 "${RUNNER_TEMP}/provider-acceptance-provenance"
+          cosign verify --new-bundle-format=false "$image" \
+            --certificate-identity "$identity" --certificate-github-workflow-sha "$publisher" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            > "${RUNNER_TEMP}/provider-acceptance-provenance/signature.json"
+          gh attestation verify "oci://$image" --repo devantler/provider-upjet-github \
+            --cert-identity "$identity" --signer-digest "$publisher" --source-digest "$publisher" \
+            --source-ref refs/heads/main --deny-self-hosted-runners \
+            --predicate-type https://github.com/devantler/provider-upjet-github/attestations/upstream-source/v1 \
+            --format json > "${RUNNER_TEMP}/provider-acceptance-provenance/attestation.json"
+      - name: Run credential-free native verification and old-new-old recovery
+        run: node .github/scripts/verify-owned-provider.mjs run
+      - name: Delete only this run's disposable cluster
+        if: always()
+        run: node .github/scripts/verify-owned-provider.mjs cleanup
+      - name: Preserve scoped evidence without kubeconfig or Secrets
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: owned-provider-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/provider-acceptance/evidence/
+            ${{ runner.temp }}/provider-acceptance-provenance/
+          if-no-files-found: warn
+          retention-days: 7
