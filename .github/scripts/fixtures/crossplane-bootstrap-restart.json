@@ -1,0 +1,376 @@
+{
+  "source": {
+    "run": 34247804182,
+    "head": "0798ef021c8ccad0ca7b99d6a5980dc4026644bb",
+    "note": "Reduced from actual failed disposable-run artifact10065024424; no credentials, environment, mounts or network addresses retained."
+  },
+  "deployments": [
+    {
+      "metadata": {
+        "name": "crossplane",
+        "namespace": "crossplane-system",
+        "uid": "98f45282-26ec-40d4-8620-5ffac66003e0",
+        "generation": 1
+      },
+      "spec": {
+        "replicas": 1,
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "crossplane",
+                "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+              }
+            ],
+            "initContainers": [
+              {
+                "name": "crossplane-init",
+                "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "availableReplicas": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-09-08T15:56:26Z",
+            "lastUpdateTime": "2026-09-08T15:56:26Z",
+            "message": "Deployment has minimum availability.",
+            "reason": "MinimumReplicasAvailable",
+            "status": "True",
+            "type": "Available"
+          },
+          {
+            "lastTransitionTime": "2026-09-08T15:55:59Z",
+            "lastUpdateTime": "2026-09-08T15:56:26Z",
+            "message": "ReplicaSet \"crossplane-649774f96c\" has successfully progressed.",
+            "reason": "NewReplicaSetAvailable",
+            "status": "True",
+            "type": "Progressing"
+          }
+        ],
+        "observedGeneration": 1,
+        "readyReplicas": 1,
+        "replicas": 1,
+        "terminatingReplicas": 0,
+        "updatedReplicas": 1
+      }
+    },
+    {
+      "metadata": {
+        "name": "crossplane-rbac-manager",
+        "namespace": "crossplane-system",
+        "uid": "8bba0dcf-b863-4734-bdc4-b512b9d07354",
+        "generation": 1
+      },
+      "spec": {
+        "replicas": 1,
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "crossplane",
+                "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+              }
+            ],
+            "initContainers": [
+              {
+                "name": "crossplane-init",
+                "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+              }
+            ]
+          }
+        }
+      },
+      "status": {
+        "availableReplicas": 1,
+        "conditions": [
+          {
+            "lastTransitionTime": "2026-09-08T15:56:22Z",
+            "lastUpdateTime": "2026-09-08T15:56:22Z",
+            "message": "Deployment has minimum availability.",
+            "reason": "MinimumReplicasAvailable",
+            "status": "True",
+            "type": "Available"
+          },
+          {
+            "lastTransitionTime": "2026-09-08T15:55:59Z",
+            "lastUpdateTime": "2026-09-08T15:56:22Z",
+            "message": "ReplicaSet \"crossplane-rbac-manager-57f46dc446\" has successfully progressed.",
+            "reason": "NewReplicaSetAvailable",
+            "status": "True",
+            "type": "Progressing"
+          }
+        ],
+        "observedGeneration": 1,
+        "readyReplicas": 1,
+        "replicas": 1,
+        "terminatingReplicas": 0,
+        "updatedReplicas": 1
+      }
+    }
+  ],
+  "replicaSets": [
+    {
+      "metadata": {
+        "name": "crossplane-649774f96c",
+        "namespace": "crossplane-system",
+        "uid": "f0c86d18-0524-411d-943a-3e1614f192aa",
+        "generation": 1,
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "blockOwnerDeletion": true,
+            "controller": true,
+            "kind": "Deployment",
+            "name": "crossplane",
+            "uid": "98f45282-26ec-40d4-8620-5ffac66003e0"
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "crossplane-rbac-manager-57f46dc446",
+        "namespace": "crossplane-system",
+        "uid": "fcc79b0f-2d1b-456e-b46d-8db7419f59ee",
+        "generation": 1,
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "blockOwnerDeletion": true,
+            "controller": true,
+            "kind": "Deployment",
+            "name": "crossplane-rbac-manager",
+            "uid": "8bba0dcf-b863-4734-bdc4-b512b9d07354"
+          }
+        ]
+      }
+    }
+  ],
+  "pods": [
+    {
+      "metadata": {
+        "name": "crossplane-649774f96c-7cjvd",
+        "namespace": "crossplane-system",
+        "uid": "64e3bda8-185a-4bc2-a62c-f11956393a2f",
+        "generation": 1,
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "blockOwnerDeletion": true,
+            "controller": true,
+            "kind": "ReplicaSet",
+            "name": "crossplane-649774f96c",
+            "uid": "f0c86d18-0524-411d-943a-3e1614f192aa"
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "crossplane",
+            "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+          }
+        ],
+        "initContainers": [
+          {
+            "name": "crossplane-init",
+            "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+          }
+        ]
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:12Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "PodReadyToStartContainers"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:24Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "Initialized"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:26Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "Ready"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:26Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "ContainersReady"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:11Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "PodScheduled"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "crossplane",
+            "imageID": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b",
+            "containerID": "containerd://4caba8f35bda7ed88420bf4c226e4712d802b69274a0fa6b6e799b96e60cab5d",
+            "restartCount": 1,
+            "ready": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-09-08T15:56:25Z"
+              }
+            },
+            "lastState": {
+              "terminated": {
+                "containerID": "containerd://21294ad3da7d834264cb1bf45533d1cacfb3371efc9a03ac3f704d167f00ca46",
+                "exitCode": 1,
+                "finishedAt": "2026-09-08T15:56:24Z",
+                "reason": "Error",
+                "startedAt": "2026-09-08T15:56:24Z"
+              }
+            }
+          }
+        ],
+        "initContainerStatuses": [
+          {
+            "name": "crossplane-init",
+            "imageID": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b",
+            "containerID": "containerd://4b73748e183ee6986f114ec919c4c6bec027d01bbc3d4acba8494c17025face9",
+            "restartCount": 0,
+            "ready": true,
+            "state": {
+              "terminated": {
+                "containerID": "containerd://4b73748e183ee6986f114ec919c4c6bec027d01bbc3d4acba8494c17025face9",
+                "exitCode": 0,
+                "finishedAt": "2026-09-08T15:56:23Z",
+                "reason": "Completed",
+                "startedAt": "2026-09-08T15:56:17Z"
+              }
+            },
+            "lastState": {}
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "crossplane-rbac-manager-57f46dc446-rsbxq",
+        "namespace": "crossplane-system",
+        "uid": "01918685-57a2-48b6-9533-73057320d2ff",
+        "generation": 1,
+        "ownerReferences": [
+          {
+            "apiVersion": "apps/v1",
+            "blockOwnerDeletion": true,
+            "controller": true,
+            "kind": "ReplicaSet",
+            "name": "crossplane-rbac-manager-57f46dc446",
+            "uid": "fcc79b0f-2d1b-456e-b46d-8db7419f59ee"
+          }
+        ]
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "crossplane",
+            "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+          }
+        ],
+        "initContainers": [
+          {
+            "name": "crossplane-init",
+            "image": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b"
+          }
+        ]
+      },
+      "status": {
+        "phase": "Running",
+        "conditions": [
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:13Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "PodReadyToStartContainers"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:22Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "Initialized"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:22Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "Ready"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:22Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "ContainersReady"
+          },
+          {
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-09-08T15:56:11Z",
+            "observedGeneration": 1,
+            "status": "True",
+            "type": "PodScheduled"
+          }
+        ],
+        "containerStatuses": [
+          {
+            "name": "crossplane",
+            "imageID": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b",
+            "containerID": "containerd://79174896c9a5ae0dfc838acf7493cd74ca374c4e041802cb6757d7b8476e908b",
+            "restartCount": 0,
+            "ready": true,
+            "state": {
+              "running": {
+                "startedAt": "2026-09-08T15:56:22Z"
+              }
+            },
+            "lastState": {}
+          }
+        ],
+        "initContainerStatuses": [
+          {
+            "name": "crossplane-init",
+            "imageID": "xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b",
+            "containerID": "containerd://75748fb3f0ceaee2787c1a8bc3f9fe7b9f8cbb8c478a914844624dbbfd131f9f",
+            "restartCount": 0,
+            "ready": true,
+            "state": {
+              "terminated": {
+                "containerID": "containerd://75748fb3f0ceaee2787c1a8bc3f9fe7b9f8cbb8c478a914844624dbbfd131f9f",
+                "exitCode": 0,
+                "finishedAt": "2026-09-08T15:56:19Z",
+                "reason": "Completed",
+                "startedAt": "2026-09-08T15:56:17Z"
+              }
+            },
+            "lastState": {}
+          }
+        ]
+      }
+    }
+  ],
+  "activations": []
+}

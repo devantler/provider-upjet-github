@@ -263,3 +263,158 @@ test('the unchanged render guards inspect later stream resources, including init
     assert.throws(() => assertRenderedObjects(parseRenderedObjects(rendered + '\n' + JSON.stringify(bad))), /unpinned Crossplane render/);
   }
 });
+
+import * as harness from "./verify-owned-provider.mjs";
+
+const fixture = () => JSON.parse(fs.readFileSync(new URL('./fixtures/crossplane-bootstrap-restart.json', import.meta.url)));
+function transport(snapshot = fixture()) {
+  const calls = []; const saved = [];
+  const io = {
+    read(kind, name, options) {
+      calls.push({ kind, name, options });
+      const key = { Deployment: 'deployments', ReplicaSet: 'replicaSets', Pod: 'pods' }[kind];
+      const value = snapshot[key].find(o => o.metadata.name === name);
+      assert.ok(value, 'unexpected read target');
+      return structuredClone(value);
+    },
+    logs(pod, container, previous, options) {
+      calls.push({ log: true, pod, container, previous, options });
+      return previous ? '2026-09-08T15:56:24Z startup failed: diagnostic fixture\n' : '2026-09-08T15:56:25Z controller ready\n';
+    },
+    events(pod, options) {
+      calls.push({ event: true, pod, options });
+      return [{ involvedObject: { kind: 'Pod', namespace: 'crossplane-system', name: pod.name, uid: pod.uid },
+        type: 'Warning', reason: 'BackOff', message: 'Synthetic event for the exact owned Pod.' }];
+    },
+    save(name, value) { saved.push({ name, value }); },
+  };
+  return { io, calls, saved };
+}
+
+test('actual restart fixture remains rejected and captures its bounded evidence before cleanup', () => {
+  const snapshot = fixture(); const t = transport(snapshot); const order = [];
+  assert.throws(() => harness.assertBootstrap(snapshot), /bootstrap proof/);
+  const primary = new Error('original bootstrap refusal');
+  assert.throws(() => harness.finishResult(primary, () => order.push('cleanup'), (name, value) => {
+    t.io.save(name, value); if (name === 'bootstrap-diagnostics') order.push('diagnostics');
+  }, {}, () => harness.collectBootstrapDiagnostics(snapshot, {
+    ...t.io, save(name, value) { t.io.save(name, value); order.push('diagnostics'); },
+  })), error => error === primary);
+  assert.deepEqual(order, ['diagnostics', 'cleanup']);
+  const proof = t.saved.find(v => v.name === 'bootstrap-diagnostics').value;
+  assert.equal(proof.pods.length, 2);
+  assert.equal(proof.pods.flatMap(p => p.logs).length, 8);
+  assert.ok(proof.pods[0].logs.some(l => l.previous && l.text.includes('startup failed')));
+  assert.equal(t.saved.find(v => v.name === 'result').value.passed, false);
+  assert.ok(t.calls.every(c => c.options.timeout > 0 && c.options.timeout <= 3000 && c.options.maxBuffer <= 262144));
+});
+
+test('diagnostic and diagnostic-save failures cannot hide the primary failure or prevent cleanup', () => {
+  const primary = new Error('original failure'); const order = [];
+  assert.throws(() => harness.finishResult(primary, () => order.push('cleanup'), (name, value) => {
+    if (name === 'diagnostic-failure') throw new Error('private filesystem detail');
+    order.push(name); assert.equal(value.failure, primary.message);
+  }, {}, () => { order.push('diagnose'); throw new Error('credential-like private error'); }), error => error === primary);
+  assert.deepEqual(order, ['diagnose', 'cleanup', 'result']);
+});
+
+test('successful runs do not collect diagnostic logs', () => {
+  let diagnostic = false;
+  harness.finishResult(undefined, () => {}, () => {}, {}, () => { diagnostic = true; });
+  assert.equal(diagnostic, false);
+});
+
+for (const [name, mutate] of [
+  ['foreign namespace', s => { s.pods[0].metadata.namespace = 'other'; }],
+  ['wrong Pod owner', s => { s.pods[0].metadata.ownerReferences[0].uid = 'foreign'; }],
+  ['wrong ReplicaSet owner', s => { s.replicaSets[0].metadata.ownerReferences[0].uid = 'foreign'; }],
+  ['different Deployment image', s => { s.deployments[0].spec.template.spec.containers[0].image = 'unreviewed'; }],
+  ['different runtime image', s => { s.pods[0].status.containerStatuses[0].imageID = 'unreviewed'; }],
+  ['unapproved container name', s => { s.pods[0].spec.containers[0].name = 'other'; }],
+]) test(`refuses ${name} before any logs or events`, () => {
+  const snapshot = fixture(); mutate(snapshot); const t = transport(snapshot);
+  assert.throws(() => harness.collectBootstrapDiagnostics(snapshot, t.io), /diagnostic scope/);
+  assert.equal(t.calls.filter(c => c.log || c.event).length, 0);
+});
+
+test('refuses a replaced live Pod before reading logs', () => {
+  const snapshot = fixture(); const t = transport(snapshot); const read = t.io.read;
+  t.io.read = (kind, ...args) => { const o = read(kind, ...args); if (kind === 'Pod') o.metadata.uid = 'replaced'; return o; };
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  assert.equal(t.calls.filter(c => c.log || c.event).length, 0);
+  assert.ok(t.saved[0].value.pods.every(p => p.error === 'diagnostic capture unavailable'));
+});
+
+test('discards log output if the Pod identity changes during the request', () => {
+  const snapshot = fixture(); const t = transport(snapshot); const read = t.io.read; const logs = t.io.logs; let changed = false;
+  t.io.logs = (...args) => { changed = true; return logs(...args); };
+  t.io.read = (kind, ...args) => { const o = read(kind, ...args); if (kind === 'Pod' && changed) o.metadata.uid = 'replaced'; return o; };
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  assert.ok(t.calls.some(c => c.log));
+  assert.ok(!JSON.stringify(t.saved).includes('controller ready'));
+});
+
+test('rejects another Pods event instead of accepting an imprecise event query', () => {
+  const snapshot = fixture(); const t = transport(snapshot);
+  t.io.events = () => [{ involvedObject: { kind: 'Pod', namespace: 'crossplane-system', name: 'other', uid: 'other' }, message: 'must not be saved' }];
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  assert.ok(!JSON.stringify(t.saved).includes('must not be saved'));
+});
+
+test('log size and line limits fail closed without saving exception details', () => {
+  for (const text of ['x'.repeat(16385), Array(102).fill('line').join('\n')]) {
+    const snapshot = fixture(); const t = transport(snapshot); t.io.logs = () => text;
+    harness.collectBootstrapDiagnostics(snapshot, t.io);
+    assert.ok(!JSON.stringify(t.saved).includes(text));
+    assert.ok(t.saved[0].value.pods.every(p => p.logs.every(l => l.error === 'diagnostic capture unavailable')));
+  }
+});
+
+test('transport failures save only a fixed diagnostic error', () => {
+  const snapshot = fixture(); const t = transport(snapshot); t.io.logs = () => { throw new Error('secret-like external error'); };
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  assert.ok(!JSON.stringify(t.saved).includes('secret-like'));
+  assert.ok(t.saved[0].value.pods.every(p => p.logs.every(l => l.error === 'diagnostic capture unavailable')));
+});
+
+test('an exhausted diagnostic time budget issues no further requests and still permits cleanup', t => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const snapshot = fixture(); const transportState = transport(snapshot); const read = transportState.io.read;
+  transportState.io.read = (...args) => { now += 3000; return read(...args); };
+  let cleaned = false; const primary = new Error('original failure');
+  assert.throws(() => harness.finishResult(primary, () => { cleaned = true; }, () => {}, {},
+    () => harness.collectBootstrapDiagnostics(snapshot, transportState.io)), e => e === primary);
+  assert.equal(cleaned, true);
+  assert.ok(transportState.calls.filter(c => c.kind).length <= 15);
+  assert.ok(transportState.saved[0].value.pods.some(p => p.error || p.logs.some(l => l.error)));
+});
+
+test('missing previous logs retain current logs and do not hide the original failure', () => {
+  const snapshot = fixture(); const t = transport(snapshot); const logs = t.io.logs;
+  t.io.logs = (pod, container, previous, options) => {
+    if (previous) throw new Error('previous terminated container not found');
+    return logs(pod, container, previous, options);
+  };
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  for (const p of t.saved[0].value.pods) {
+    assert.equal(p.logs.filter(l => l.text).length, 2);
+    assert.equal(p.logs.filter(l => l.previous && l.error === 'diagnostic capture unavailable').length, 2);
+  }
+});
+
+test('prioritizes the observed restarted core main-container previous log', () => {
+  const snapshot = fixture(); const t = transport(snapshot);
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  const first = t.calls.find(c => c.log);
+  assert.equal(first.pod.name, 'crossplane-649774f96c-7cjvd');
+  assert.equal(first.container, 'crossplane');
+  assert.equal(first.previous, true);
+});
+
+test('refuses a live read returning a different Pod name even with the saved UID', () => {
+  const snapshot = fixture(); const t = transport(snapshot); const read = t.io.read;
+  t.io.read = (kind, ...args) => { const value = read(kind, ...args); if (kind === 'Pod') value.metadata.name += '-other'; return value; };
+  harness.collectBootstrapDiagnostics(snapshot, t.io);
+  assert.equal(t.calls.filter(c => c.log || c.event).length, 0);
+});

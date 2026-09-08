@@ -100,8 +100,96 @@ export function assertBootstrap(s) {
   }
 }
 
-export function finishResult(primaryError, cleanup, save, details) {
+export function collectBootstrapDiagnostics(snapshot, io) {
+  const scope = ok => assert.ok(ok, 'diagnostic scope requires exact owned Crossplane runtimes');
+  const namespace = 'crossplane-system';
+  const deadline = Date.now() + 45_000;
+  const options = (maxBuffer = 262144) => {
+    const remaining = deadline - Date.now();
+    scope(remaining > 0);
+    return { timeout: Math.min(3000, remaining), maxBuffer };
+  };
+  const identity = object => {
+    scope(object?.metadata?.namespace === namespace && typeof object.metadata.uid === 'string' && object.metadata.uid.length > 0
+      && /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(object.metadata.name));
+  };
+  const validate = (d, rs, pod) => {
+    for (const o of [d, rs, pod]) identity(o);
+    scope(owner(rs, d.metadata.uid) && owner(pod, rs.metadata.uid));
+    scope(rs.metadata.name.startsWith(`${d.metadata.name}-`) && pod.metadata.name.startsWith(`${rs.metadata.name}-`));
+    for (const [key, statusKey, name] of [['containers', 'containerStatuses', 'crossplane'], ['initContainers', 'initContainerStatuses', 'crossplane-init']]) {
+      const declared = d.spec?.template?.spec?.[key]; const actual = pod.spec?.[key]; const states = pod.status?.[statusKey];
+      scope(declared?.length === 1 && actual?.length === 1 && states?.length === 1);
+      scope(declared[0].name === name && actual[0].name === name && states[0].name === name
+        && declared[0].image === CORE && actual[0].image === CORE);
+      scope([CORE.split('@')[1], 'sha256:520767ddca99c7c7a3a33039d15cbd867ca6658097cee5c01394ca33c299d1b3']
+        .some(digest => states[0].imageID === digest || states[0].imageID?.endsWith(`@${digest}`)));
+    }
+  };
+  // Validate both targets before any log/event read. Readiness and restarts are
+  // deliberately not prerequisites for diagnostics; their acceptance guards remain unchanged.
+  const targets = ['crossplane', 'crossplane-rbac-manager'].map(name => {
+    const ds = snapshot?.deployments?.filter(d => d.metadata.name === name); scope(ds?.length === 1);
+    const d = ds[0]; const sets = snapshot.replicaSets.filter(r => owner(r, d.metadata.uid));
+    const pods = snapshot.pods.filter(p => sets.some(r => owner(p, r.metadata.uid)));
+    scope(pods.length === 1);
+    const pod = pods[0]; const rs = sets.find(r => owner(pod, r.metadata.uid));
+    validate(d, rs, pod);
+    return { d, rs, pod };
+  });
+  const results = [];
+  for (const target of targets) {
+    const result = { name: target.pod.metadata.name, uid: target.pod.metadata.uid, namespace, logs: [] };
+    const refresh = () => {
+      const objects = ['Deployment', 'ReplicaSet', 'Pod'].map((kind, i) => {
+        const expected = [target.d, target.rs, target.pod][i];
+        const actual = io.read(kind, expected.metadata.name, options());
+        scope(actual.metadata.name === expected.metadata.name && actual.metadata.uid === expected.metadata.uid
+          && actual.metadata.generation === expected.metadata.generation);
+        return actual;
+      });
+      validate(...objects); return objects[2];
+    };
+    try {
+      refresh();
+      for (const container of ['crossplane', 'crossplane-init']) for (const previous of (
+        container === 'crossplane' && target.pod.status.containerStatuses[0].restartCount > 0 ? [true, false] : [false, true])) {
+        const log = { container, previous };
+        try {
+          const before = refresh();
+          const text = io.logs(result, container, previous, options(32768));
+          const after = refresh();
+          const states = p => [...p.status.containerStatuses, ...p.status.initContainerStatuses].find(c => c.name === container);
+          scope(states(before).containerID === states(after).containerID && states(before).restartCount === states(after).restartCount);
+          scope(typeof text === 'string' && Buffer.byteLength(text) <= 16384 && text.replace(/\n$/, '').split('\n').length <= 100);
+          log.text = text;
+        } catch { log.error = 'diagnostic capture unavailable'; }
+        result.logs.push(log);
+      }
+      try {
+        refresh();
+        const events = io.events(result, options(65536));
+        refresh();
+        scope(Array.isArray(events) && events.length <= 50);
+        result.events = events.map(e => {
+          const ref = e.involvedObject;
+          scope(ref?.kind === 'Pod' && ref.namespace === namespace && ref.uid === result.uid && ref.name === result.name);
+          return { type: e.type, reason: e.reason, message: String(e.message ?? '').slice(0, 2048), count: e.count,
+            firstTimestamp: e.firstTimestamp, lastTimestamp: e.lastTimestamp };
+        });
+      } catch { result.eventError = 'diagnostic capture unavailable'; }
+    } catch { result.error = 'diagnostic capture unavailable'; }
+    results.push(result);
+  }
+  io.save('bootstrap-diagnostics', { namespace, pods: results });
+}
+
+export function finishResult(primaryError, cleanup, save, details, diagnose = () => {}) {
   let error = primaryError;
+  if (error) {
+    try { diagnose(); }
+    catch { try { save('diagnostic-failure', { message: 'diagnostic capture unavailable' }); } catch { /* Preserve primary error and cleanup. */ } }
+  }
   try { cleanup(); } catch (cleanupError) { save('cleanup-failure', { message: cleanupError.message }); error ??= cleanupError; }
   save('result', { ...details, passed: !error, ...(error ? { failure: error.message } : {}) });
   if (error) throw error;
@@ -235,13 +323,13 @@ function runner(env) {
   const runtimeEnv = runtimeEnvironment(env, root);
   const marker = { ...identity, sha: env.GITHUB_SHA, run: env.GITHUB_RUN_ID, attempt: env.GITHUB_RUN_ATTEMPT };
   const executable = name => ['ksail', 'helm', 'kubectl'].includes(name) ? path.join(tools, name) : name;
-  const command = (name, args, { input, privateInput = false, timeout = 60_000, cwd = root } = {}) => {
-    const result = spawnSync(executable(name), args, { env: runtimeEnv, cwd, input, encoding: 'utf8', timeout, maxBuffer: 32 * 1024 * 1024 });
+  const command = (name, args, { input, privateInput = false, timeout = 60_000, maxBuffer = 32 * 1024 * 1024, cwd = root } = {}) => {
+    const result = spawnSync(executable(name), args, { env: runtimeEnv, cwd, input, encoding: 'utf8', timeout, maxBuffer });
     if (result.error || result.status !== 0) throw new Error(`${name} ${args[0]} failed: ${privateInput ? 'private chart input withheld' : (result.error?.message ?? result.stderr ?? '').slice(-5000)}`);
     return result.stdout;
   };
   const save = (name, data) => fs.writeFileSync(path.join(evidence, `${name}.json`), `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  const kubeGuard = () => assertKubeconfig(JSON.parse(command('kubectl', ['config', 'view', '--raw', '--kubeconfig', kubeconfig, '-o', 'json'])), context);
+  const kubeGuard = options => assertKubeconfig(JSON.parse(command('kubectl', ['config', 'view', '--raw', '--kubeconfig', kubeconfig, '-o', 'json'], options)), context);
   const k = (args, options) => {
     kubeGuard();
     return command('ksail', ['workload', ...args, '--kubeconfig', kubeconfig, '--context', context, '--request-timeout=20s', '--cache-dir', path.join(root, 'discovery')], options);
@@ -326,7 +414,7 @@ function runner(env) {
     fs.writeFileSync(path.join(project, 'kind.yaml'), JSON.stringify({ apiVersion: 'kind.x-k8s.io/v1alpha4', kind: 'Cluster', name: cluster,
       networking: { apiServerAddress: '127.0.0.1' }, nodes: [{ role: 'control-plane', image: NODE }] }));
     fs.writeFileSync(path.join(root, 'ownership.json'), JSON.stringify(marker), { mode: 0o600 });
-    let baseline; let primaryError;
+    let baseline; let primaryError; let bootstrapSnapshot;
     try {
       command('ksail', ['cluster', 'create', '--config', config, ...flags], { cwd: project, timeout: 480_000 });
       kubeGuard();
@@ -342,7 +430,7 @@ function runner(env) {
       assertRenderedObjects(objects);
       command('helm', ['upgrade', '--install', 'crossplane', chart, '--namespace', 'crossplane-system', '--create-namespace', '--values', valuesPath,
         '--kubeconfig', kubeconfig, '--kube-context', context, '--wait', '--timeout', '5m'], { timeout: 330_000 });
-      await until('crossplane', () => ({ deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),
+      await until('crossplane', () => (bootstrapSnapshot = { deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),
         replicaSets: list('replicasets.apps', '-n', 'crossplane-system').map(brief), pods: list('pods', '-n', 'crossplane-system').map(brief),
         activations: list('managedresourceactivationpolicies.apiextensions.crossplane.io') }), assertBootstrap);
       for (const field of ['issuer', 'subject']) {
@@ -385,7 +473,18 @@ function runner(env) {
       }
     }
     finishResult(primaryError, cleanup, save, { ...marker, old: OLD, new: NEW, oldTrust: 'digest-only baseline; no legacy signature claim',
-      nativeTrust: 'new digest prefix, strict issuer and subject; publisher SHA verified separately', fixture: 'paused and credential-free; external reconciliation is not exercised' });
+      nativeTrust: 'new digest prefix, strict issuer and subject; publisher SHA verified separately', fixture: 'paused and credential-free; external reconciliation is not exercised' }, () => {
+      kubeGuard({ timeout: 3000, maxBuffer: 65536 });
+      const diagnostic = (args, options) => command('kubectl', [...args, '--namespace', 'crossplane-system', '--kubeconfig', kubeconfig,
+        '--context', context, '--request-timeout=2s', '--cache-dir', path.join(root, 'discovery')], { ...options, privateInput: true });
+      collectBootstrapDiagnostics(bootstrapSnapshot, {
+        read: (kind, name, options) => JSON.parse(diagnostic(['get', kind, name, '-o', 'json'], options)),
+        logs: (pod, container, previous, options) => diagnostic(['logs', pod.name, '--container', container, `--previous=${previous}`,
+          '--tail=100', '--limit-bytes=16384', '--timestamps=true', '--pod-running-timeout=2s'], options),
+        events: (pod, options) => JSON.parse(diagnostic(['get', 'events', '--field-selector', `involvedObject.uid=${pod.uid}`, '-o', 'json'], options)).items,
+        save,
+      });
+    });
   };
   return { run, cleanup };
 }
