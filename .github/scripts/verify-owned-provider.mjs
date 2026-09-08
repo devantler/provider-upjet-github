@@ -80,6 +80,17 @@ export function assertRenderedObjects(objects) {
 
 export function assertBootstrap(s) {
   const check = (ok) => assert.ok(ok, 'bootstrap proof requires both owned ready runtimes and all pinned container identities');
+  const identity = object => {
+    check(object.metadata.name && object.metadata.uid && !object.metadata.deletionTimestamp && object.metadata.namespace === 'crossplane-system'
+      && Number.isSafeInteger(object.metadata.generation) && object.metadata.generation > 0);
+    return { name: object.metadata.name, uid: object.metadata.uid, generation: object.metadata.generation };
+  };
+  const timestamp = value => {
+    check(typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(value)
+      && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 19) === value.slice(0, 19));
+    return Date.parse(value);
+  };
+  const identities = [];
   check(s.deployments.length === 2 && s.activations.length === 0 && s.pods.length === 2);
   check(JSON.stringify(s.deployments.map(d => d.metadata.name).sort()) === '["crossplane","crossplane-rbac-manager"]');
   for (const d of s.deployments) {
@@ -89,14 +100,79 @@ export function assertBootstrap(s) {
     const pods = s.pods.filter(p => !p.metadata.deletionTimestamp && sets.some(rs => owner(p, rs.metadata.uid)));
     check(pods.length === 1);
     const pod = pods[0];
-    check(pod.status.phase === 'Running' && conditions(pod).some(c => c.type === 'Ready' && c.status === 'True'));
+    check(pod.status.phase === 'Running' && ['Ready', 'Initialized'].every(type => conditions(pod).some(c => c.type === type && c.status === 'True')));
+    const item = { deployment: identity(d), replicaSets: sets.map(identity).sort((a, b) => a.name.localeCompare(b.name)), pod: identity(pod), containers: [] };
     for (const [specKey, statusKey] of [['containers', 'containerStatuses'], ['initContainers', 'initContainerStatuses']]) {
       const declared = d.spec.template.spec[specKey] ?? []; const actual = pod.spec[specKey] ?? []; const states = pod.status[statusKey] ?? [];
       check(declared.length === 1 && actual.length === 1 && states.length === 1);
       check(declared[0].image === CORE && actual[0].image === CORE && declared[0].name === actual[0].name && states[0].name === actual[0].name);
-      check(states[0].restartCount === 0 && (specKey === 'containers' ? states[0].ready : states[0].state?.terminated?.exitCode === 0));
+      const state = states[0];
+      check(Number.isSafeInteger(state.restartCount) && state.restartCount >= 0
+        && typeof state.containerID === 'string' && /^[a-z0-9-]+:\/\/[^\s]+$/.test(state.containerID));
+      if (specKey === 'containers') {
+        check(state.ready === true && Object.keys(state.state ?? {}).join() === 'running');
+        timestamp(state.state.running.startedAt);
+      } else {
+        check(declared[0].restartPolicy !== 'Always' && actual[0].restartPolicy !== 'Always'
+          && Object.keys(state.state ?? {}).join() === 'terminated' && state.state.terminated.exitCode === 0);
+        const terminated = state.state.terminated;
+        check(terminated.containerID === state.containerID && timestamp(terminated.startedAt) <= timestamp(terminated.finishedAt)
+          && timestamp(terminated.finishedAt) <= timestamp(pod.status.containerStatuses[0].state.running.startedAt));
+      }
       check([CORE.split('@')[1], 'sha256:520767ddca99c7c7a3a33039d15cbd867ca6658097cee5c01394ca33c299d1b3'].some(digest => states[0].imageID === digest || states[0].imageID?.endsWith(`@${digest}`)));
+      item.containers.push({ name: state.name, containerID: state.containerID, imageID: state.imageID, restartCount: state.restartCount, state: state.state });
     }
+    identities.push(item);
+  }
+  return identities.sort((a, b) => a.deployment.name.localeCompare(b.deployment.name));
+}
+
+export async function waitForBootstrap(observe, save, { now = () => performance.now(), sleep = delay } = {}) {
+  let previousTime = -Infinity;
+  const clock = () => {
+    const value = now();
+    proof(Number.isFinite(value) && value >= previousTime, 'bootstrap monotonic clock');
+    previousTime = value;
+    return value;
+  };
+  const started = clock();
+  let baseline; let firstAt; let lastAt; let lastSnapshot; let lastFailure;
+  const samples = [];
+  try {
+    // The same six-minute overall budget includes readiness and the stable minute.
+    // The attempt cap also refuses a stuck injected clock; no baseline is reset.
+    for (let attempt = 0; attempt < 73; attempt++) {
+      proof(clock() - started <= 360_000, 'bootstrap overall deadline');
+      let value; let identities; let error;
+      try { value = observe(); lastSnapshot = value; identities = assertBootstrap(value); }
+      catch (caught) { error = caught; }
+      const at = clock();
+      proof(at - started <= 360_000, 'bootstrap overall deadline');
+      if (baseline) {
+        if (error) throw error;
+        proof(at - lastAt <= 15_000, 'bootstrap observation gap');
+        assert.deepEqual(identities, baseline, 'bootstrap runtime changed after the stability baseline');
+      } else if (!error) {
+        baseline = structuredClone(identities); firstAt = at;
+        save('crossplane-first-observation', value);
+      } else lastFailure = error;
+      if (baseline) {
+        lastAt = at;
+        samples.push({ elapsedMilliseconds: at - firstAt, identities });
+        save('crossplane-stability', { elapsedMilliseconds: at - firstAt, samples });
+        if (at - firstAt >= 60_000 && samples.length >= 5) {
+          save('crossplane', value);
+          return value;
+        }
+      }
+      proof(clock() - started <= 355_000, 'bootstrap overall deadline');
+      await sleep(5000);
+    }
+    throw new Error(`bootstrap overall deadline: ${lastFailure?.message ?? 'stable observation window incomplete'}`);
+  } catch (error) {
+    try { if (lastSnapshot) save('crossplane-last-observation', lastSnapshot); }
+    catch { /* Diagnostic persistence must not replace the primary failure. */ }
+    throw error;
   }
 }
 
@@ -430,9 +506,9 @@ function runner(env) {
       assertRenderedObjects(objects);
       command('helm', ['upgrade', '--install', 'crossplane', chart, '--namespace', 'crossplane-system', '--create-namespace', '--values', valuesPath,
         '--kubeconfig', kubeconfig, '--kube-context', context, '--wait', '--timeout', '5m'], { timeout: 330_000 });
-      await until('crossplane', () => (bootstrapSnapshot = { deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),
+      await waitForBootstrap(() => (bootstrapSnapshot = { deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),
         replicaSets: list('replicasets.apps', '-n', 'crossplane-system').map(brief), pods: list('pods', '-n', 'crossplane-system').map(brief),
-        activations: list('managedresourceactivationpolicies.apiextensions.crossplane.io') }), assertBootstrap);
+        activations: list('managedresourceactivationpolicies.apiextensions.crossplane.io') }), save);
       for (const field of ['issuer', 'subject']) {
         const policy = positivePolicy();
         policy.spec.verification.cosign.authorities[0].name = `acceptance-reject-${field}`;
