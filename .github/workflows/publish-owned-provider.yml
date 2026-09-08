@@ -1,0 +1,211 @@
+name: Publish owned provider bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish and sign the temporary owned package after building it
+        type: boolean
+        default: false
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: owned-provider-020
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: github.repository == 'devantler/provider-upjet-github' && github.repository_id == '1278532211' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            crank-sha256: fe3ac3abde4ed48df87583c2392f1a17cb968115f58511243dc29783c0350013
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            crank-sha256: 53c89eb9e432076526d8dd1d545ae4ca8307a589442bd832a3bc5d9b09f79c49
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out the dispatch's publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: publisher
+      - name: Test and enforce the publication boundary
+        id: boundary
+        run: |
+          node --test publisher/.github/scripts/owned-provider-publisher.test.mjs
+          node publisher/.github/scripts/owned-provider-publisher.mjs context
+      - name: Check out the released upstream runtime
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: crossplane-contrib/provider-upjet-github
+          ref: a211e095e2fe49c477836acec2ad4a28aa60e030
+          persist-credentials: false
+          submodules: true
+          path: runtime
+      - name: Verify the immutable runtime and build submodule
+        run: node publisher/.github/scripts/owned-provider-publisher.mjs source runtime
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.2'
+          cache: false
+      - name: Set up the native Docker builder
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.37.0
+          driver: docker
+      - name: Install the checksum-pinned Crossplane packager
+        env:
+          ARCH: ${{ matrix.arch }}
+          CRANK_SHA256: ${{ matrix.crank-sha256 }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://releases.crossplane.io/stable/v2.1.3/bin/linux_${ARCH}/crank" \
+            --output "${RUNNER_TEMP}/crossplane"
+          printf '%s  %s\n' "$CRANK_SHA256" "${RUNNER_TEMP}/crossplane" | sha256sum --check --strict
+          chmod +x "${RUNNER_TEMP}/crossplane"
+      - name: Build the unmodified runtime and package
+        working-directory: runtime
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.boundary.outputs.tag }}
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
+        run: |
+          go mod download
+          go mod verify
+          make -j2 build.all PLATFORMS="linux_${ARCH}" VERSION="$VERSION" \
+            CROSSPLANE_CLI="${RUNNER_TEMP}/crossplane" UP=/bin/true \
+            XPKG_REG_ORGS=ghcr.io/devantler REGISTRY_ORGS=ghcr.io/devantler
+      - name: Verify source parity and record package bytes
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.boundary.outputs.tag }}
+        run: |
+          node publisher/.github/scripts/owned-provider-publisher.mjs source runtime
+          mkdir package
+          cp "runtime/_output/xpkg/linux_${ARCH}/provider-upjet-github-${VERSION}.xpkg" package/provider.xpkg
+          node publisher/.github/scripts/owned-provider-publisher.mjs receipt package "$ARCH"
+      - name: Preserve this run's package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: package-${{ matrix.arch }}
+          path: package/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: build
+    if: inputs.publish == true && github.repository == 'devantler/provider-upjet-github' && github.repository_id == '1278532211' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the same publisher
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck the publication boundary
+        id: boundary
+        run: node .github/scripts/owned-provider-publisher.mjs context
+      - name: Download only this run's packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: package-*
+          path: packages
+      - name: Verify both package receipts and bytes
+        run: node .github/scripts/owned-provider-publisher.mjs verify packages
+      - name: Install the checksum-pinned packager
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://releases.crossplane.io/stable/v2.1.3/bin/linux_amd64/crank \
+            --output "${RUNNER_TEMP}/crossplane"
+          printf '%s  %s\n' fe3ac3abde4ed48df87583c2392f1a17cb968115f58511243dc29783c0350013 "${RUNNER_TEMP}/crossplane" | sha256sum --check --strict
+          chmod +x "${RUNNER_TEMP}/crossplane"
+      - name: Set up manifest inspection
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.37.0
+          driver: docker
+      - name: Install Cosign with the installer's embedded checksum
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Authenticate only to owned GHCR publication
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username devantler --password-stdin
+      - name: Publish the two-architecture package
+        id: package
+        env:
+          IMAGE: ${{ steps.boundary.outputs.image }}
+          VERSION: ${{ steps.boundary.outputs.tag }}
+        run: |
+          "${RUNNER_TEMP}/crossplane" xpkg push \
+            --package-files packages/package-amd64/provider.xpkg \
+            --package-files packages/package-arm64/provider.xpkg \
+            "${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' > manifest.json
+          jq --exit-status '([.manifests[].platform | .os + "/" + .architecture] | sort) == ["linux/amd64", "linux/arm64"]' manifest.json
+          digest=$(jq --exit-status --raw-output '.digest | select(test("^sha256:[a-f0-9]{64}$"))' manifest.json)
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Sign the immutable package digest
+        env:
+          IMAGE: ${{ steps.boundary.outputs.image }}
+          DIGEST: ${{ steps.package.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Attest the exact upstream source and package checksums
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.boundary.outputs.image }}
+          subject-digest: ${{ steps.package.outputs.digest }}
+          predicate-type: https://github.com/devantler/provider-upjet-github/attestations/upstream-source/v1
+          predicate-path: source-provenance.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Verify the signature and attestation identities
+        env:
+          IMAGE: ${{ steps.boundary.outputs.image }}
+          DIGEST: ${{ steps.package.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          identity=https://github.com/devantler/provider-upjet-github/.github/workflows/publish-owned-provider.yml@refs/heads/main
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "$identity" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" \
+            --repo devantler/provider-upjet-github \
+            --cert-identity "$identity" \
+            --signer-digest "$GITHUB_SHA" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref refs/heads/main --deny-self-hosted-runners \
+            --predicate-type https://github.com/devantler/provider-upjet-github/attestations/upstream-source/v1 \
+            --format json > attestation-verification.json
+          jq --exit-status --slurpfile expected source-provenance.json \
+            'any(.[]; .verificationResult.statement.predicate == $expected[0])' attestation-verification.json
+          # shellcheck disable=SC2016
+          printf 'Temporary owned package: `%s@%s`\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Clear registry credentials
+        if: always()
+        run: docker logout ghcr.io
