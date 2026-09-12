@@ -57,6 +57,20 @@ export function safeStartPermissionResult(verb, status, output) {
 const owner = (object, uid) => object.metadata?.ownerReferences?.some(r => r.uid === uid && r.controller === true);
 const conditions = object => object.status?.conditions ?? [];
 const currentTrue = (object, type) => conditions(object).some(c => c.type === type && c.status === 'True' && c.observedGeneration === object.metadata.generation);
+export function managedDefinitionEstablished(crd, definition, revisionUid) {
+  const refs = crd?.metadata?.ownerReferences ?? [];
+  if (refs.length !== 2 || !definition?.metadata?.uid || !revisionUid) return false;
+  const definitionRefs = refs.filter(ref => ref.apiVersion === 'apiextensions.crossplane.io/v1alpha1'
+    && ref.kind === 'ManagedResourceDefinition' && ref.name === definition.metadata.name
+    && ref.uid === definition.metadata.uid && ref.controller !== true);
+  const revisionRefs = refs.filter(ref => ref.apiVersion === 'pkg.crossplane.io/v1'
+    && ref.kind === 'ProviderRevision' && ref.uid === revisionUid
+    && ref.controller === true && ref.blockOwnerDeletion === true);
+  return crd.metadata.name === definition.metadata.name
+    && conditions(crd).some(c => c.type === 'Established' && c.status === 'True')
+    && definition.spec?.state === 'Active' && currentTrue(definition, 'Established')
+    && definitionRefs.length === 1 && revisionRefs.length === 1;
+}
 const proof = (ok, message) => assert.ok(ok, `acceptance proof: ${message}`);
 export function parseRenderedObjects(output) {
   const fail = ok => assert.ok(ok, 'invalid rendered JSON resource stream');
@@ -511,8 +525,7 @@ export function assertHealthy(s, ref, generation, baseline) {
   for (const name of ACTIVE) {
     const crd = s.crds.find(c => c.metadata.name === name);
     const definition = s.definitions.find(c => c.metadata.name === name);
-    proof(crd?.metadata.uid && conditions(crd).some(c => c.type === 'Established' && c.status === 'True') && definition?.spec.state === 'Active'
-      && owner(crd, definition.metadata.uid), `active definition not established: ${name}`);
+    proof(crd?.metadata.uid && managedDefinitionEstablished(crd, definition, r.metadata.uid), `active definition not established: ${name}`);
   }
   for (const definition of s.definitions.filter(d => d.kind === 'ManagedResourceDefinition')) {
     proof(definition.spec.state === (ACTIVE.includes(definition.metadata.name) ? 'Active' : 'Inactive'), 'unexpected managed definition activation');
