@@ -136,6 +136,7 @@ test('bootstrap requires both owned ready Deployments and every container identi
   for (const change of [
     x => { x.pods[0].status.containerStatuses = []; }, x => { x.pods[0].status.initContainerStatuses = []; },
     x => { x.pods[0].spec.containers[0].image = image; }, x => { x.deployments[0].spec.template.spec.containers[0].image = image; },
+    x => { x.pods[0].spec.containers[0].args = ['core', 'start']; }, x => { delete x.deployments[0].spec.template.spec.containers[0].args; },
     x => { x.pods[0].metadata.ownerReferences = own('other'); }, x => { x.replicaSets[0].metadata.ownerReferences = own('other'); },
     x => { x.pods[0].status.containerStatuses[0].imageID = image; }, x => { x.pods[0].status.initContainerStatuses[0].state.terminated.exitCode = 1; },
     x => { x.deployments.pop(); }, x => { x.activations.push({}); },
@@ -282,15 +283,20 @@ test('rejects list wrappers and bounds document count and total input size', () 
   assert.throws(() => parseRenderedObjects(' '.repeat(32 * 1024 * 1024 + 1)), /rendered JSON/);
 });
 
-test('the unchanged render guards inspect later stream resources, including init container images', () => {
+test('the render guards require pinned images and active signature verification', () => {
   const output = fs.readFileSync(new URL('./fixtures/crossplane-serviceaccounts.kubectl-1.36.4.jsonstream', import.meta.url), 'utf8');
   const image = 'xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b';
   const runtime = { apiVersion: 'apps/v1', kind: 'Deployment', metadata: { name: 'crossplane' }, spec: { template: { spec: {
-    containers: [{ image }], initContainers: [{ image }],
+    containers: [{ name: 'crossplane', image, args: ['core', 'start', '--enable-signature-verification'] }],
+    initContainers: [{ name: 'crossplane-init', image, args: ['core', 'init'] }],
   } } } };
   const rendered = output + JSON.stringify(runtime);
   assert.doesNotThrow(() => assertRenderedObjects(parseRenderedObjects(rendered)));
   assert.throws(() => assertRenderedObjects(parseRenderedObjects(output)), /unpinned Crossplane render/);
+  for (const args of [undefined, ['core', 'start'], ['core', 'start', '--enable-signature-verification', '--debug']]) {
+    const bad = structuredClone(runtime); bad.spec.template.spec.containers[0].args = args;
+    assert.throws(() => assertRenderedObjects(parseRenderedObjects(output + JSON.stringify(bad))), /signature verification disabled/);
+  }
   for (const kind of ['Provider', 'Function', 'Configuration', 'ManagedResourceActivationPolicy']) {
     const extra = JSON.stringify({ apiVersion: 'pkg.crossplane.io/v1', kind, metadata: { name: 'unexpected' } });
     assert.throws(() => assertRenderedObjects(parseRenderedObjects(rendered + '\n' + extra)), /unexpected bootstrap package or activation/);

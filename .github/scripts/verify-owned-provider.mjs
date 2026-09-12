@@ -76,6 +76,13 @@ export function assertRenderedObjects(objects) {
   proof(!objects.some(o => ['Provider', 'Function', 'Configuration', 'ManagedResourceActivationPolicy'].includes(o.kind)), 'unexpected bootstrap package or activation');
   const images = objects.flatMap(o => [...(o.spec?.template?.spec?.containers ?? []), ...(o.spec?.template?.spec?.initContainers ?? [])].map(c => c.image));
   proof(images.length >= 2 && images.every(image => image === CORE), 'unpinned Crossplane render');
+  const managers = objects.filter(o => o.kind === 'Deployment' && o.metadata?.name === 'crossplane');
+  const manager = managers[0]?.spec?.template?.spec;
+  proof(managers.length === 1
+    && manager.containers?.length === 1
+    && JSON.stringify(manager.containers[0].args) === '["core","start","--enable-signature-verification"]'
+    && manager.initContainers?.length === 1
+    && JSON.stringify(manager.initContainers[0].args) === '["core","init"]', 'signature verification disabled');
 }
 
 export function assertBootstrap(s) {
@@ -106,6 +113,10 @@ export function assertBootstrap(s) {
       const declared = d.spec.template.spec[specKey] ?? []; const actual = pod.spec[specKey] ?? []; const states = pod.status[statusKey] ?? [];
       check(declared.length === 1 && actual.length === 1 && states.length === 1);
       check(declared[0].image === CORE && actual[0].image === CORE && declared[0].name === actual[0].name && states[0].name === actual[0].name);
+      if (d.metadata.name === 'crossplane') {
+        const expectedArgs = specKey === 'containers' ? ['core', 'start', '--enable-signature-verification'] : ['core', 'init'];
+        check(JSON.stringify(declared[0].args) === JSON.stringify(expectedArgs) && JSON.stringify(actual[0].args) === JSON.stringify(expectedArgs));
+      }
       const state = states[0];
       check(Number.isSafeInteger(state.restartCount) && state.restartCount >= 0
         && typeof state.containerID === 'string' && /^[a-z0-9-]+:\/\/[^\s]+$/.test(state.containerID));
@@ -526,7 +537,7 @@ function runner(env) {
     try {
       command('ksail', ['cluster', 'create', '--config', config, ...flags], { cwd: project, timeout: 480_000 });
       kubeGuard();
-      const values = { image: { repository: CORE, ignoreTag: true, pullPolicy: 'IfNotPresent' }, provider: { packages: [], defaultActivations: [] }, configuration: { packages: [] }, function: { packages: [] },
+      const values = { image: { repository: CORE, ignoreTag: true, pullPolicy: 'IfNotPresent' }, args: ['--enable-signature-verification'], provider: { packages: [], defaultActivations: [] }, configuration: { packages: [] }, function: { packages: [] },
         resourcesCrossplane: { requests: { cpu: '100m', memory: '256Mi' }, limits: { memory: '512Mi' } },
         resourcesRBACManager: { requests: { cpu: '100m', memory: '64Mi' }, limits: { memory: '128Mi' } } };
       const valuesPath = path.join(root, 'crossplane-values.json');
