@@ -37,7 +37,7 @@ function healthyFixture(ref = old) {
   return {
     provider: { metadata: { name: 'github-acceptance', uid: 'provider-uid', generation: 3 }, spec: { package: ref,
       runtimeConfigRef: { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: 'github-acceptance' } },
-      status: { currentIdentifier: ref, currentRevision: 'actual-revision-name', conditions: [condition('Healthy', 3), condition('Installed', 3)], appliedImageConfigRefs: [{ name: 'owned-provider-acceptance', reason: 'VerifyImage' }] } },
+      status: { currentIdentifier: ref, currentRevision: 'actual-revision-name', conditions: [condition('Healthy', 3), condition('Installed', 3)] } },
     revisions: [{ metadata: { name: 'actual-revision-name', uid: 'revision-uid', generation: 1, ownerReferences: own('provider-uid') },
       spec: { image: ref, desiredState: 'Active' }, status: { conditions: [condition('RevisionHealthy'), condition('RuntimeHealthy'), condition('RuntimeActive')], objectRefs: refs } }],
     deployments: [{ metadata: { name: 'controller', uid: 'deployment-uid', generation: 2, ownerReferences: own('revision-uid') },
@@ -253,7 +253,6 @@ const corruptions = [
   ['stale Provider health', s => { s.provider.status.conditions[0].observedGeneration = 2; }],
   ['wrong package', s => { s.provider.spec.package = old; }],
   ['wrong runtime config', s => { s.provider.spec.runtimeConfigRef.name = 'default'; }],
-  ['missing signature selection', s => { s.provider.status.appliedImageConfigRefs = []; }],
   ['stale active revision', s => { s.revisions[0].spec.image = old; }],
   ['two active revisions', s => { s.revisions.push(structuredClone(s.revisions[0])); }],
   ['unhealthy revision', s => { s.revisions[0].status.conditions[0].status = 'False'; }],
@@ -284,6 +283,13 @@ const corruptions = [
   ['credential configuration added', s => { s.providerConfigs.push({}); }],
   ['wildcard activation added', s => { s.activation.spec.activate.push('*'); }],
 ];
+
+test('accepts Crossplane 2.4 provider status without a verification image config reference', () => {
+  const snapshot = healthyFixture(image);
+  assert.equal(Object.hasOwn(snapshot.provider.status, 'appliedImageConfigRefs'), false);
+  assert.doesNotThrow(() => assertHealthy(snapshot, image, 3, healthyFixture()));
+});
+
 for (const [name, change] of corruptions) test(`rejects false success: ${name}`, () => {
   const s = healthyFixture(image); change(s);
   assert.throws(() => assertHealthy(s, image, 3, healthyFixture()), /acceptance proof/);

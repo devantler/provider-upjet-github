@@ -486,7 +486,6 @@ export function assertHealthy(s, ref, generation, baseline) {
   proof(currentTrue(p, 'Healthy') && currentTrue(p, 'Installed'), 'current Provider health');
   proof(s.providerConfigs?.length === 0, 'credential configuration exists');
   proof(JSON.stringify([...s.activation.spec.activate].sort()) === JSON.stringify([...ACTIVE].sort()), 'activation scope changed');
-  if (ref === NEW) proof(p.status.appliedImageConfigRefs?.some(c => c.name === 'owned-provider-acceptance' && c.reason === 'VerifyImage'), 'strict signature policy not selected');
   const active = s.revisions.filter(r => r.spec.desiredState === 'Active');
   proof(active.length === 1, 'exactly one active revision required');
   const r = active[0];
