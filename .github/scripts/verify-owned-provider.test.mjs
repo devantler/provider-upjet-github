@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartCommand, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects, providerManifest, safeStartObjects } from './verify-owned-provider.mjs';
+import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartCommand, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects, providerManifest, safeStartObjects, safeStartPermissionResult } from './verify-owned-provider.mjs';
 const inventory = JSON.parse(fs.readFileSync(new URL('./owned-provider-inventory.json', import.meta.url), 'utf8'));
 
 const image = 'ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8';
@@ -105,6 +105,15 @@ test('provider runtime uses the fixed SafeStart identity with only CRD read perm
   ]);
   assert.deepEqual(providerManifest(old).spec.runtimeConfigRef,
     { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: 'github-acceptance' });
+});
+
+test('kubectl denied writes are accepted only as the expected SafeStart proof', () => {
+  for (const verb of ['get', 'list', 'watch']) assert.equal(safeStartPermissionResult(verb, 0, 'yes\n'), 'yes');
+  for (const verb of ['create', 'update', 'patch', 'delete']) assert.equal(safeStartPermissionResult(verb, 1, 'no\n'), 'no');
+  for (const candidate of [
+    ['get', 1, 'no\n'], ['get', 0, 'no\n'], ['create', 0, 'no\n'], ['create', 1, 'yes\n'],
+    ['create', 2, 'no\n'], ['create', 1, ''], ['delete', null, 'no\n'], ['unknown', 1, 'no\n'],
+  ]) assert.throws(() => safeStartPermissionResult(...candidate), /SafeStart permission proof/);
 });
 
 test('refuses kubeconfig fallback, remote servers, exec credentials and TLS bypass', () => {
