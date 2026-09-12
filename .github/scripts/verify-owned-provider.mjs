@@ -29,6 +29,22 @@ export const positivePolicy = () => ({ apiVersion: 'pkg.crossplane.io/v1beta1', 
   spec: { matchImages: [{ type: 'Prefix', prefix: NEW }], verification: { provider: 'Cosign', cosign: {
     authorities: [{ name: 'owned-publisher', keyless: { identities: [{ issuer: ISSUER, subject: SUBJECT }] } }],
   } } } });
+const PROVIDER_NAME = 'github-acceptance';
+const RUNTIME_SERVICE_ACCOUNT = 'github-acceptance-runtime';
+const SAFE_START_ROLE = 'github-acceptance-safe-start';
+export const safeStartObjects = () => [
+  { apiVersion: 'v1', kind: 'ServiceAccount', metadata: { name: RUNTIME_SERVICE_ACCOUNT, namespace: 'crossplane-system' } },
+  { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: { name: SAFE_START_ROLE },
+    rules: [{ apiGroups: ['apiextensions.k8s.io'], resources: ['customresourcedefinitions'], verbs: ['get', 'list', 'watch'] }] },
+  { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRoleBinding', metadata: { name: SAFE_START_ROLE },
+    roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: SAFE_START_ROLE },
+    subjects: [{ kind: 'ServiceAccount', name: RUNTIME_SERVICE_ACCOUNT, namespace: 'crossplane-system' }] },
+  { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', metadata: { name: PROVIDER_NAME },
+    spec: { serviceAccountTemplate: { metadata: { name: RUNTIME_SERVICE_ACCOUNT } } } },
+];
+export const providerManifest = ref => ({ apiVersion: 'pkg.crossplane.io/v1', kind: 'Provider', metadata: { name: PROVIDER_NAME },
+  spec: { package: ref, packagePullPolicy: 'IfNotPresent', revisionActivationPolicy: 'Automatic', revisionHistoryLimit: 1,
+    runtimeConfigRef: { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: PROVIDER_NAME } } });
 const owner = (object, uid) => object.metadata?.ownerReferences?.some(r => r.uid === uid && r.controller === true);
 const conditions = object => object.status?.conditions ?? [];
 const currentTrue = (object, type) => conditions(object).some(c => c.type === type && c.status === 'True' && c.observedGeneration === object.metadata.generation);
@@ -399,6 +415,7 @@ export function assertNegative(snapshot, variant) {
   const fail = (ok) => assert.ok(ok, 'signature rejection must be explicit and precede revision, definition and runtime installation');
   fail(variant === 'issuer' || variant === 'subject');
   fail(snapshot.provider?.spec.package === NEW);
+  fail(JSON.stringify(snapshot.provider.spec.runtimeConfigRef) === JSON.stringify(providerManifest(NEW).spec.runtimeConfigRef));
   fail(conditions(snapshot.provider).some(c => c.type === 'Healthy' && c.status === 'False'
     // Crossplane runtime 2.4.0 validate.go wraps Cosign's certificate-identity error with this exact authority.
     && (c.message ?? '').includes(`authority "acceptance-reject-${variant}": signature verification failed with `)
@@ -442,6 +459,7 @@ export function assertHealthy(s, ref, generation, baseline) {
   proof(ref === OLD || ref === NEW, 'unapproved package');
   const p = s.provider;
   proof(p?.metadata.uid && p.metadata.generation === generation && p.spec.package === ref && p.status.currentIdentifier === ref, 'current Provider identity/source');
+  proof(JSON.stringify(p.spec.runtimeConfigRef) === JSON.stringify(providerManifest(ref).spec.runtimeConfigRef), 'current Provider runtime config');
   proof(currentTrue(p, 'Healthy') && currentTrue(p, 'Installed'), 'current Provider health');
   proof(s.providerConfigs?.length === 0, 'credential configuration exists');
   proof(JSON.stringify([...s.activation.spec.activate].sort()) === JSON.stringify([...ACTIVE].sort()), 'activation scope changed');
@@ -457,6 +475,7 @@ export function assertHealthy(s, ref, generation, baseline) {
   proof(count > 0 && d.status.observedGeneration === d.metadata.generation
     && ['replicas', 'updatedReplicas', 'readyReplicas', 'availableReplicas'].every(k => d.status[k] === count), 'current Deployment not ready');
   proof(d.spec.template.spec.containers.length === 1 && d.spec.template.spec.containers[0].image === ref, 'Deployment image override');
+  proof(d.spec.template.spec.serviceAccountName === RUNTIME_SERVICE_ACCOUNT, 'Deployment runtime ServiceAccount');
   proof((d.spec.template.spec.initContainers ?? []).length === 0, 'unreviewed provider init container');
   const sets = s.replicaSets.filter(rs => owner(rs, d.metadata.uid));
   const pods = s.pods.filter(pod => !pod.metadata.deletionTimestamp && sets.some(rs => owner(pod, rs.metadata.uid)));
@@ -464,6 +483,7 @@ export function assertHealthy(s, ref, generation, baseline) {
   for (const pod of pods) {
     proof(pod.status.phase === 'Running' && conditions(pod).some(c => c.type === 'Ready' && c.status === 'True'), 'Pod not ready');
     proof(pod.spec.containers.length === 1 && pod.spec.containers[0].image === ref, 'Pod image override');
+    proof(pod.spec.serviceAccountName === RUNTIME_SERVICE_ACCOUNT, 'Pod runtime ServiceAccount');
     proof((pod.spec.initContainers ?? []).length === 0, 'unreviewed provider Pod init container');
     const states = pod.status.containerStatuses ?? [];
     proof(states.length === 1 && states[0].ready && states[0].restartCount === 0, 'runtime container state');
@@ -553,9 +573,8 @@ function runner(env) {
     deletionTimestamp: o.metadata.deletionTimestamp,
   }, spec: o.kind === 'CustomResourceDefinition' ? undefined : o.kind === 'ManagedResourceDefinition' ? { state: o.spec.state } : o.spec, status: o.status });
   const packageObjects = objects => objects.filter(o => o.metadata.name.endsWith('.github.upbound.io') || o.metadata.name.endsWith('.github.m.upbound.io'));
-  const providerName = 'github-acceptance';
-  const provider = ref => ({ apiVersion: 'pkg.crossplane.io/v1', kind: 'Provider', metadata: { name: providerName },
-    spec: { package: ref, packagePullPolicy: 'IfNotPresent', revisionActivationPolicy: 'Automatic', revisionHistoryLimit: 1 } });
+  const providerName = PROVIDER_NAME;
+  const provider = providerManifest;
   let lastSnapshot;
   // Bounded local API observations inside this single disposable job, not remote CI polling.
   const until = async (phase, observe, check, milliseconds = 360_000) => {
@@ -643,6 +662,33 @@ function runner(env) {
         replicaSets: list('replicasets.apps', '-n', 'crossplane-system').map(brief), pods: list('pods', '-n', 'crossplane-system').map(brief),
         activations: list('managedresourceactivationpolicies.apiextensions.crossplane.io') });
       await waitForBootstrap(() => (bootstrapSnapshot = observeBootstrap()), save);
+      // The package advertises SafeStart and checks these three permissions at
+      // startup. Without them it eagerly lists managed kinds while Crossplane
+      // is still establishing their CRDs, which caused the accepted runtime to
+      // restart once. Keep this additive role read-only and prove its boundary
+      // before any Provider exists.
+      const safeStart = safeStartObjects();
+      for (const object of safeStart) apply(object);
+      const [serviceAccount, role, binding, runtimeConfig] = safeStart;
+      const storedServiceAccount = get('serviceaccounts', serviceAccount.metadata.name, '-n', serviceAccount.metadata.namespace);
+      assert.equal(storedServiceAccount.metadata.name, serviceAccount.metadata.name, 'SafeStart ServiceAccount name');
+      assert.equal(storedServiceAccount.metadata.namespace, serviceAccount.metadata.namespace, 'SafeStart ServiceAccount namespace');
+      assert.deepEqual(get('clusterroles.rbac.authorization.k8s.io', role.metadata.name).rules, role.rules, 'SafeStart ClusterRole rules');
+      const storedBinding = get('clusterrolebindings.rbac.authorization.k8s.io', binding.metadata.name);
+      assert.deepEqual(storedBinding.roleRef, binding.roleRef, 'SafeStart ClusterRoleBinding role');
+      assert.deepEqual(storedBinding.subjects, binding.subjects, 'SafeStart ClusterRoleBinding subject');
+      assert.deepEqual(get('deploymentruntimeconfigs.pkg.crossplane.io', runtimeConfig.metadata.name).spec.serviceAccountTemplate,
+        runtimeConfig.spec.serviceAccountTemplate, 'SafeStart runtime ServiceAccount template');
+      const safeStartIdentity = `system:serviceaccount:crossplane-system:${RUNTIME_SERVICE_ACCOUNT}`;
+      const permissions = {};
+      for (const verb of ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']) {
+        kubeGuard();
+        const allowed = command('kubectl', ['auth', 'can-i', verb, 'customresourcedefinitions.apiextensions.k8s.io', '--as', safeStartIdentity,
+          '--kubeconfig', kubeconfig, '--context', context, '--request-timeout=20s', '--cache-dir', path.join(root, 'discovery')]).trim();
+        assert.equal(allowed, ['get', 'list', 'watch'].includes(verb) ? 'yes' : 'no', `SafeStart CRD permission: ${verb}`);
+        permissions[verb] = allowed;
+      }
+      save('provider-safe-start', { serviceAccount: RUNTIME_SERVICE_ACCOUNT, role: SAFE_START_ROLE, permissions });
       const synchronizePolicy = async (policy, phase) => {
         const before = observeBootstrap();
         assertBootstrap(before);

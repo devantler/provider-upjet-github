@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartCommand, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects } from './verify-owned-provider.mjs';
+import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartCommand, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects, providerManifest, safeStartObjects } from './verify-owned-provider.mjs';
 const inventory = JSON.parse(fs.readFileSync(new URL('./owned-provider-inventory.json', import.meta.url), 'utf8'));
 
 const image = 'ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8';
@@ -34,15 +34,16 @@ function healthyFixture(ref = old) {
   }));
   const refs = definitions.map(({ apiVersion, kind, metadata }) => ({ apiVersion, kind, name: metadata.name, uid: metadata.uid }));
   return {
-    provider: { metadata: { name: 'github-acceptance', uid: 'provider-uid', generation: 3 }, spec: { package: ref },
+    provider: { metadata: { name: 'github-acceptance', uid: 'provider-uid', generation: 3 }, spec: { package: ref,
+      runtimeConfigRef: { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: 'github-acceptance' } },
       status: { currentIdentifier: ref, currentRevision: 'actual-revision-name', conditions: [condition('Healthy', 3), condition('Installed', 3)], appliedImageConfigRefs: [{ name: 'owned-provider-acceptance', reason: 'VerifyImage' }] } },
     revisions: [{ metadata: { name: 'actual-revision-name', uid: 'revision-uid', generation: 1, ownerReferences: own('provider-uid') },
       spec: { image: ref, desiredState: 'Active' }, status: { conditions: [condition('RevisionHealthy'), condition('RuntimeHealthy'), condition('RuntimeActive')], objectRefs: refs } }],
     deployments: [{ metadata: { name: 'controller', uid: 'deployment-uid', generation: 2, ownerReferences: own('revision-uid') },
-      spec: { replicas: 1, template: { spec: { containers: [{ name: 'package-runtime', image: ref }] } } },
+      spec: { replicas: 1, template: { spec: { serviceAccountName: 'github-acceptance-runtime', containers: [{ name: 'package-runtime', image: ref }] } } },
       status: { observedGeneration: 2, replicas: 1, updatedReplicas: 1, availableReplicas: 1, readyReplicas: 1 } }],
     replicaSets: [{ metadata: { uid: 'rs-uid', ownerReferences: own('deployment-uid') } }],
-    pods: [{ metadata: { uid: 'pod-uid', ownerReferences: own('rs-uid') }, spec: { containers: [{ name: 'package-runtime', image: ref }] },
+    pods: [{ metadata: { uid: 'pod-uid', ownerReferences: own('rs-uid') }, spec: { serviceAccountName: 'github-acceptance-runtime', containers: [{ name: 'package-runtime', image: ref }] },
       status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }], containerStatuses: [{ name: 'package-runtime', ready: true, restartCount: 0, imageID: `docker-pullable://${ref}` }] } }],
     definitions, crds: [...activeNames.map((name, i) => ({ metadata: { name, uid: `crd-${i}`, ownerReferences: own(definitions.find(d => d.metadata.name === name).metadata.uid) }, status: { conditions: [condition('Established')] } })),
       ...definitions.filter(d => d.kind === 'CustomResourceDefinition').map(d => ({ ...structuredClone(d), status: { conditions: [condition('Established')] } }))],
@@ -91,6 +92,21 @@ test('requires the exact digest, strict identity and sole authority in the real 
   ]) { const p = structuredClone(policy); change(p); assert.throws(() => assertPolicy(p), /signature policy/); }
 });
 
+test('provider runtime uses the fixed SafeStart identity with only CRD read permissions', () => {
+  assert.deepEqual(safeStartObjects(), [
+    { apiVersion: 'v1', kind: 'ServiceAccount', metadata: { name: 'github-acceptance-runtime', namespace: 'crossplane-system' } },
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: { name: 'github-acceptance-safe-start' },
+      rules: [{ apiGroups: ['apiextensions.k8s.io'], resources: ['customresourcedefinitions'], verbs: ['get', 'list', 'watch'] }] },
+    { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRoleBinding', metadata: { name: 'github-acceptance-safe-start' },
+      roleRef: { apiGroup: 'rbac.authorization.k8s.io', kind: 'ClusterRole', name: 'github-acceptance-safe-start' },
+      subjects: [{ kind: 'ServiceAccount', name: 'github-acceptance-runtime', namespace: 'crossplane-system' }] },
+    { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', metadata: { name: 'github-acceptance' },
+      spec: { serviceAccountTemplate: { metadata: { name: 'github-acceptance-runtime' } } } },
+  ]);
+  assert.deepEqual(providerManifest(old).spec.runtimeConfigRef,
+    { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: 'github-acceptance' });
+});
+
 test('refuses kubeconfig fallback, remote servers, exec credentials and TLS bypass', () => {
   const config = { 'current-context': 'kind-provider-acceptance-1234-1',
     contexts: [{ name: 'kind-provider-acceptance-1234-1', context: { cluster: 'local', user: 'local' } }],
@@ -110,7 +126,8 @@ test('refuses kubeconfig fallback, remote servers, exec credentials and TLS bypa
 });
 
 test('requires real signature rejection and no installed revision or runtime', () => {
-  const snapshot = { provider: { spec: { package: image }, status: { conditions: [
+  const snapshot = { provider: { spec: { package: image,
+    runtimeConfigRef: { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: 'github-acceptance' } }, status: { conditions: [
     { type: 'Healthy', status: 'False', message: 'cannot unpack package: authority "acceptance-reject-issuer": signature verification failed with no matching signatures: none of the expected identities matched what was in the certificate, got subjects [synthetic] with issuer synthetic' },
   ] } }, revisions: [], deployments: [], pods: [], definitions: [] };
   assert.doesNotThrow(() => assertNegative(snapshot, 'issuer'));
@@ -205,6 +222,7 @@ test('terminal success is written only after cleanup and a failed recovery canno
 const corruptions = [
   ['stale Provider health', s => { s.provider.status.conditions[0].observedGeneration = 2; }],
   ['wrong package', s => { s.provider.spec.package = old; }],
+  ['wrong runtime config', s => { s.provider.spec.runtimeConfigRef.name = 'default'; }],
   ['missing signature selection', s => { s.provider.status.appliedImageConfigRefs = []; }],
   ['stale active revision', s => { s.revisions[0].spec.image = old; }],
   ['two active revisions', s => { s.revisions.push(structuredClone(s.revisions[0])); }],
@@ -212,6 +230,8 @@ const corruptions = [
   ['missing runtime health', s => { s.revisions[0].status.conditions = s.revisions[0].status.conditions.filter(c => c.type !== 'RuntimeHealthy'); }],
   ['stale runtime activation', s => { s.revisions[0].status.conditions.find(c => c.type === 'RuntimeActive').observedGeneration = 0; }],
   ['unready Deployment', s => { s.deployments[0].status.availableReplicas = 0; }],
+  ['wrong runtime ServiceAccount', s => { s.deployments[0].spec.template.spec.serviceAccountName = 'default'; }],
+  ['wrong runtime Pod ServiceAccount', s => { s.pods[0].spec.serviceAccountName = 'default'; }],
   ['wrong runtime image', s => { s.pods[0].status.containerStatuses[0].imageID = `docker-pullable://${old}`; }],
   ['unexpected provider init container', s => { s.pods[0].spec.initContainers = [{ name: 'unreviewed', image }]; }],
   ['unowned runtime', s => { s.replicaSets[0].metadata.ownerReferences = own('other'); }],
