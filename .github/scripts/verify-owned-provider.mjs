@@ -305,6 +305,32 @@ export function assertNegative(snapshot, variant) {
   for (const key of ['revisions', 'deployments', 'pods', 'definitions']) fail(Array.isArray(snapshot[key]) && snapshot[key].length === 0);
 }
 
+export function assertPolicyManagerReload(before, after) {
+  const fail = ok => assert.ok(ok, 'policy synchronization requires a newly ready package-manager runtime and an unchanged RBAC manager');
+  let previous; let current;
+  try {
+    previous = assertBootstrap(before);
+    current = assertBootstrap(after);
+  } catch {
+    fail(false);
+  }
+  const previousManager = previous.find(item => item.deployment.name === 'crossplane');
+  const currentManager = current.find(item => item.deployment.name === 'crossplane');
+  const previousRBAC = previous.find(item => item.deployment.name === 'crossplane-rbac-manager');
+  const currentRBAC = current.find(item => item.deployment.name === 'crossplane-rbac-manager');
+  fail(previousManager && currentManager && previousRBAC && currentRBAC);
+  fail(currentManager.deployment.uid === previousManager.deployment.uid
+    && currentManager.deployment.generation > previousManager.deployment.generation
+    && currentManager.pod.uid !== previousManager.pod.uid);
+  const previousSets = new Set(previousManager.replicaSets.map(item => item.uid));
+  const currentPod = after.pods.find(item => item.metadata.uid === currentManager.pod.uid);
+  const currentPodOwner = currentPod?.metadata.ownerReferences?.find(item => item.controller === true && item.kind === 'ReplicaSet');
+  fail(currentPodOwner && !previousSets.has(currentPodOwner.uid)
+    && currentManager.replicaSets.some(item => item.uid === currentPodOwner.uid));
+  assert.deepEqual(currentRBAC, previousRBAC,
+    'policy synchronization requires a newly ready package-manager runtime and an unchanged RBAC manager');
+}
+
 export function assertHealthy(s, ref, generation, baseline) {
   proof(ref === OLD || ref === NEW, 'unapproved package');
   const p = s.provider;
@@ -506,20 +532,32 @@ function runner(env) {
       assertRenderedObjects(objects);
       command('helm', ['upgrade', '--install', 'crossplane', chart, '--namespace', 'crossplane-system', '--create-namespace', '--values', valuesPath,
         '--kubeconfig', kubeconfig, '--kube-context', context, '--wait', '--timeout', '5m'], { timeout: 330_000 });
-      await waitForBootstrap(() => (bootstrapSnapshot = { deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),
+      const observeBootstrap = () => ({ deployments: list('deployments.apps', '-n', 'crossplane-system').map(brief),
         replicaSets: list('replicasets.apps', '-n', 'crossplane-system').map(brief), pods: list('pods', '-n', 'crossplane-system').map(brief),
-        activations: list('managedresourceactivationpolicies.apiextensions.crossplane.io') }), save);
+        activations: list('managedresourceactivationpolicies.apiextensions.crossplane.io') });
+      await waitForBootstrap(() => (bootstrapSnapshot = observeBootstrap()), save);
+      const synchronizePolicy = async (policy, phase) => {
+        const before = observeBootstrap();
+        assertBootstrap(before);
+        apply(policy);
+        assert.deepEqual(get('imageconfigs.pkg.crossplane.io', policy.metadata.name).spec, policy.spec, 'image policy not stored exactly');
+        // Kubernetes readiness follows cache synchronization during controller startup. Replacing the
+        // package-manager Pod after the write closes the informer race before a Provider can exist.
+        k(['rollout', 'restart', 'deployment/crossplane', '--namespace', 'crossplane-system']);
+        bootstrapSnapshot = await until(`policy-${phase}-loaded`, observeBootstrap,
+          after => assertPolicyManagerReload(before, after), 120_000);
+      };
       for (const field of ['issuer', 'subject']) {
         const policy = positivePolicy();
         policy.spec.verification.cosign.authorities[0].name = `acceptance-reject-${field}`;
         policy.spec.verification.cosign.authorities[0].keyless.identities[0][field] = `https://invalid.example/${field}`;
-        apply(policy);
-        assert.deepEqual(get('imageconfigs.pkg.crossplane.io', policy.metadata.name).spec, policy.spec, 'negative policy not stored exactly');
+        await synchronizePolicy(policy, `reject-${field}`);
         apply(provider(NEW));
         await until(`reject-${field}`, negativeSnapshot, s => assertNegative(s, field), 120_000);
         k(['delete', 'providers.pkg.crossplane.io', providerName, '--wait=true', '--timeout=60s'], { timeout: 80_000 });
       }
-      apply(positivePolicy()); assertPolicy(get('imageconfigs.pkg.crossplane.io', 'owned-provider-acceptance'));
+      await synchronizePolicy(positivePolicy(), 'accept');
+      assertPolicy(get('imageconfigs.pkg.crossplane.io', 'owned-provider-acceptance'));
       apply({ apiVersion: 'apiextensions.crossplane.io/v1alpha1', kind: 'ManagedResourceActivationPolicy', metadata: { name: 'acceptance' }, spec: { activate: ACTIVE } });
       apply(provider(OLD));
       const initialGeneration = get('providers.pkg.crossplane.io', providerName).metadata.generation;

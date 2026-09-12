@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects } from './verify-owned-provider.mjs';
+import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects } from './verify-owned-provider.mjs';
 const inventory = JSON.parse(fs.readFileSync(new URL('./owned-provider-inventory.json', import.meta.url), 'utf8'));
 
 const image = 'ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8';
@@ -140,6 +140,45 @@ test('bootstrap requires both owned ready Deployments and every container identi
     x => { x.pods[0].status.containerStatuses[0].imageID = image; }, x => { x.pods[0].status.initContainerStatuses[0].state.terminated.exitCode = 1; },
     x => { x.deployments.pop(); }, x => { x.activations.push({}); },
   ]) { const value = structuredClone(s); change(value); assert.throws(() => assertBootstrap(value), /bootstrap proof/); }
+});
+
+test('policy synchronization requires a new ready package-manager runtime and preserves the RBAC manager', () => {
+  const before = initRetryFixture();
+  const after = structuredClone(before);
+  const deployment = after.deployments.find(d => d.metadata.name === 'crossplane');
+  deployment.metadata.generation++;
+  deployment.status.observedGeneration++;
+  const oldSet = after.replicaSets.find(r => r.metadata.ownerReferences[0].name === 'crossplane');
+  const newSet = structuredClone(oldSet);
+  newSet.metadata.name = 'crossplane-reloaded';
+  newSet.metadata.uid = 'crossplane-reloaded-rs';
+  after.replicaSets.push(newSet);
+  const pod = after.pods.find(p => p.metadata.ownerReferences[0].name === oldSet.metadata.name);
+  pod.metadata.name = 'crossplane-reloaded-pod';
+  pod.metadata.uid = 'crossplane-reloaded-pod';
+  pod.metadata.ownerReferences[0].name = newSet.metadata.name;
+  pod.metadata.ownerReferences[0].uid = newSet.metadata.uid;
+  for (const state of [...pod.status.containerStatuses, ...pod.status.initContainerStatuses]) {
+    state.containerID = state.containerID.replace(/[^/]+$/, 'reloaded');
+    if (state.state.running) state.state.running.startedAt = '2026-09-08T17:11:33Z';
+    if (state.state.terminated) {
+      state.state.terminated.containerID = state.containerID;
+      state.state.terminated.startedAt = '2026-09-08T17:11:30Z';
+      state.state.terminated.finishedAt = '2026-09-08T17:11:31Z';
+    }
+  }
+  assert.doesNotThrow(() => assertPolicyManagerReload(before, after));
+  for (const change of [
+    s => { s.deployments.find(d => d.metadata.name === 'crossplane').metadata.generation = before.deployments[0].metadata.generation; },
+    s => { s.pods.find(p => p.metadata.name === 'crossplane-reloaded-pod').metadata.uid = before.pods[0].metadata.uid; },
+    s => { s.replicaSets.pop(); },
+    s => { s.pods.find(p => p.metadata.name === 'crossplane-reloaded-pod').metadata.ownerReferences[0].uid = oldSet.metadata.uid; },
+    s => { s.pods.find(p => p.metadata.name.includes('rbac-manager')).metadata.uid = 'replaced-rbac-manager'; },
+  ]) {
+    const invalid = structuredClone(after);
+    change(invalid);
+    assert.throws(() => assertPolicyManagerReload(before, invalid), /policy synchronization/);
+  }
 });
 
 test('terminal success is written only after cleanup and a failed recovery cannot hide the original error', () => {
