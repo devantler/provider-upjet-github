@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects } from './verify-owned-provider.mjs';
+import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartArgs, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects } from './verify-owned-provider.mjs';
 const inventory = JSON.parse(fs.readFileSync(new URL('./owned-provider-inventory.json', import.meta.url), 'utf8'));
 
 const image = 'ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8';
@@ -179,6 +179,10 @@ test('policy synchronization requires a new ready package-manager runtime and pr
     change(invalid);
     assert.throws(() => assertPolicyManagerReload(before, invalid), /policy synchronization/);
   }
+});
+
+test('policy synchronization uses the KSail-supported short namespace flag', () => {
+  assert.deepEqual(packageManagerRestartArgs(), ['rollout', 'restart', 'deployment/crossplane', '-n', 'crossplane-system']);
 });
 
 test('terminal success is written only after cleanup and a failed recovery cannot hide the original error', () => {
