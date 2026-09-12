@@ -3,7 +3,7 @@ import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
-import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartCommand, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects, providerManifest, safeStartObjects, safeStartPermissionResult } from './verify-owned-provider.mjs';
+import { assertContext, assertKubeconfig, assertNegative, assertHealthy, assertPolicy, assertPolicyManagerReload, packageManagerRestartCommand, runtimeEnvironment, assertBootstrap, finishResult, parseRenderedObjects, assertRenderedObjects, providerManifest, safeStartObjects, safeStartPermissionResult, managedDefinitionEstablished } from './verify-owned-provider.mjs';
 const inventory = JSON.parse(fs.readFileSync(new URL('./owned-provider-inventory.json', import.meta.url), 'utf8'));
 
 const image = 'ghcr.io/devantler/provider-upjet-github@sha256:7bdc33e1d5b8283b2b0a3282341cd22df562ed0bbf8ef5169739a36644f66be8';
@@ -29,8 +29,9 @@ function healthyFixture(ref = old) {
   if (ref === image) names.push(...inventory.added);
   const definitions = names.map((name, i) => ({
     apiVersion: 'apiextensions.crossplane.io/v1alpha1', kind: inventory.configuration.includes(name) ? 'CustomResourceDefinition' : 'ManagedResourceDefinition',
-    metadata: { name, uid: `definition-${i}`, ownerReferences: own('revision-uid') },
+    metadata: { name, uid: `definition-${i}`, generation: 1, ownerReferences: own('revision-uid') },
     spec: { state: activeNames.includes(name) ? 'Active' : 'Inactive' },
+    ...(activeNames.includes(name) ? { status: { conditions: [condition('Established')] } } : {}),
   }));
   const refs = definitions.map(({ apiVersion, kind, metadata }) => ({ apiVersion, kind, name: metadata.name, uid: metadata.uid }));
   return {
@@ -45,7 +46,10 @@ function healthyFixture(ref = old) {
     replicaSets: [{ metadata: { uid: 'rs-uid', ownerReferences: own('deployment-uid') } }],
     pods: [{ metadata: { uid: 'pod-uid', ownerReferences: own('rs-uid') }, spec: { serviceAccountName: 'github-acceptance-runtime', containers: [{ name: 'package-runtime', image: ref }] },
       status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }], containerStatuses: [{ name: 'package-runtime', ready: true, restartCount: 0, imageID: `docker-pullable://${ref}` }] } }],
-    definitions, crds: [...activeNames.map((name, i) => ({ metadata: { name, uid: `crd-${i}`, ownerReferences: own(definitions.find(d => d.metadata.name === name).metadata.uid) }, status: { conditions: [condition('Established')] } })),
+    definitions, crds: [...activeNames.map((name, i) => ({ metadata: { name, uid: `crd-${i}`, ownerReferences: [
+      { apiVersion: 'apiextensions.crossplane.io/v1alpha1', kind: 'ManagedResourceDefinition', name, uid: definitions.find(d => d.metadata.name === name).metadata.uid },
+      { apiVersion: 'pkg.crossplane.io/v1', kind: 'ProviderRevision', name: 'actual-revision-name', uid: 'revision-uid', controller: true, blockOwnerDeletion: true },
+    ] }, status: { conditions: [condition('Established')] } })),
       ...definitions.filter(d => d.kind === 'CustomResourceDefinition').map(d => ({ ...structuredClone(d), status: { conditions: [condition('Established')] } }))],
     providerConfigs: [], activation: { spec: { activate: [...activeNames] } },
     fixture: { metadata: { name: 'preserved', uid: 'fixture-uid', annotations: { 'crossplane.io/external-name': 'synthetic-repository', 'crossplane.io/paused': 'true' } },
@@ -114,6 +118,23 @@ test('kubectl denied writes are accepted only as the expected SafeStart proof', 
     ['get', 1, 'no\n'], ['get', 0, 'no\n'], ['create', 0, 'no\n'], ['create', 1, 'yes\n'],
     ['create', 2, 'no\n'], ['create', 1, ''], ['delete', null, 'no\n'], ['unknown', 1, 'no\n'],
   ]) assert.throws(() => safeStartPermissionResult(...candidate), /SafeStart permission proof/);
+});
+
+test('active managed CRDs keep the observed definition reference and revision controller', () => {
+  const definition = { apiVersion: 'apiextensions.crossplane.io/v1alpha1', kind: 'ManagedResourceDefinition', metadata: { name: activeNames[0], uid: 'definition-uid', generation: 2 }, spec: { state: 'Active' }, status: { conditions: [condition('Established', 2)] } };
+  const crd = { metadata: { name: activeNames[0], uid: 'crd-uid', ownerReferences: [
+    { apiVersion: definition.apiVersion, kind: definition.kind, name: definition.metadata.name, uid: definition.metadata.uid },
+    { apiVersion: 'pkg.crossplane.io/v1', kind: 'ProviderRevision', name: 'actual-revision-name', uid: 'revision-uid', controller: true, blockOwnerDeletion: true },
+  ] }, status: { conditions: [{ type: 'Established', status: 'True' }] } };
+  assert.equal(managedDefinitionEstablished(crd, definition, 'revision-uid'), true);
+  for (const change of [
+    value => { value.crd.metadata.ownerReferences[0].controller = true; },
+    value => { value.crd.metadata.ownerReferences[1].controller = false; },
+    value => { value.crd.metadata.ownerReferences[1].uid = 'other'; },
+    value => { value.crd.metadata.ownerReferences.push({ uid: 'extra' }); },
+    value => { value.definition.status.conditions[0].observedGeneration = 1; },
+    value => { value.crd.status.conditions[0].status = 'False'; },
+  ]) { const value = { crd: structuredClone(crd), definition: structuredClone(definition) }; change(value); assert.equal(managedDefinitionEstablished(value.crd, value.definition, 'revision-uid'), false); }
 });
 
 test('refuses kubeconfig fallback, remote servers, exec credentials and TLS bypass', () => {
