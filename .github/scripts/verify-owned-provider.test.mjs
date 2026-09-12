@@ -131,17 +131,7 @@ test('accepts actual current healthy revision and preserved old/new/old identiti
 });
 
 test('bootstrap requires both owned ready Deployments and every container identity', () => {
-  const core = 'xpkg.crossplane.io/crossplane/crossplane@sha256:c5d773aa940041475e2cf6b9adf3512cb382b1a6b889f53ed791192ed8ada75b';
-  const s = { deployments: [], replicaSets: [], pods: [], activations: [] };
-  for (const name of ['crossplane', 'crossplane-rbac-manager']) {
-    const spec = { containers: [{ name: 'runtime', image: core }], initContainers: [{ name: 'init', image: core }] };
-    s.deployments.push({ metadata: { name, uid: name, generation: 1 }, spec: { replicas: 1, template: { spec } },
-      status: { observedGeneration: 1, replicas: 1, updatedReplicas: 1, readyReplicas: 1, availableReplicas: 1 } });
-    s.replicaSets.push({ metadata: { uid: `${name}-rs`, ownerReferences: own(name) } });
-    s.pods.push({ metadata: { ownerReferences: own(`${name}-rs`) }, spec: structuredClone(spec), status: { phase: 'Running', conditions: [condition('Ready')],
-      containerStatuses: [{ name: 'runtime', ready: true, restartCount: 0, imageID: `docker-pullable://${core}` }],
-      initContainerStatuses: [{ name: 'init', restartCount: 0, state: { terminated: { exitCode: 0 } }, imageID: `docker-pullable://${core}` }] } });
-  }
+  const s = initRetryFixture();
   assert.doesNotThrow(() => assertBootstrap(s));
   for (const change of [
     x => { x.pods[0].status.containerStatuses = []; }, x => { x.pods[0].status.initContainerStatuses = []; },
@@ -267,6 +257,124 @@ test('the unchanged render guards inspect later stream resources, including init
 import * as harness from "./verify-owned-provider.mjs";
 
 const fixture = () => JSON.parse(fs.readFileSync(new URL('./fixtures/crossplane-bootstrap-restart.json', import.meta.url)));
+const initRetryFixture = () => JSON.parse(fs.readFileSync(new URL('./fixtures/crossplane-bootstrap-init-retry.json', import.meta.url)));
+
+test('completed native init retry is a valid bootstrap readiness snapshot', () => {
+  const s = initRetryFixture();
+  assert.equal(s.pods[0].status.initContainerStatuses[0].restartCount, 1);
+  assert.equal(s.pods[0].status.initContainerStatuses[0].state.terminated.exitCode, 0);
+  assert.doesNotThrow(() => assertBootstrap(s));
+});
+
+function stabilityIO(source = initRetryFixture()) {
+  let time = 0; let reads = 0;
+  const saved = [];
+  return { saved, get reads() { return reads; },
+    advance: milliseconds => { time += milliseconds; },
+    observe: () => { reads++; return structuredClone(source); },
+    save: (name, value) => saved.push({ name, value: structuredClone(value) }),
+    timing: { now: () => time, sleep: async milliseconds => { assert.equal(milliseconds, 5000); time += milliseconds; } },
+  };
+}
+
+test('native recovered bootstrap requires a fresh full minute of stable observations', async () => {
+  for (const source of [initRetryFixture(), fixture()]) {
+    const io = stabilityIO(source);
+    const result = await harness.waitForBootstrap(io.observe, io.save, io.timing);
+    assert.deepEqual(result, source);
+    const evidence = io.saved.findLast(s => s.name === 'crossplane-stability').value;
+    assert.equal(evidence.samples.length, 13);
+    assert.equal(evidence.elapsedMilliseconds, 60_000);
+    assert.equal(evidence.samples[0].elapsedMilliseconds, 0);
+    assert.equal(evidence.samples.at(-1).elapsedMilliseconds, 60_000);
+    assert.equal(io.saved.at(-1).name, 'crossplane');
+    assert.deepEqual(io.saved.find(s => s.name === 'crossplane-first-observation').value, source);
+  }
+});
+
+for (const [name, mutate] of [
+  ['new main restart', s => s.pods[0].status.containerStatuses[0].restartCount++],
+  ['new init restart', s => s.pods[0].status.initContainerStatuses[0].restartCount++],
+  ['decreasing init counter', s => { s.pods[0].status.initContainerStatuses[0].restartCount = 0; }],
+  ['changed Pod UID', s => { s.pods[0].metadata.uid = 'other'; }],
+  ['changed container ID', s => { s.pods[0].status.containerStatuses[0].containerID = 'containerd://other'; }],
+  ['changed init container ID', s => { s.pods[0].status.initContainerStatuses[0].containerID = 'containerd://other'; }],
+  ['changed generation', s => { s.deployments[0].metadata.generation++; s.deployments[0].status.observedGeneration++; }],
+  ['changed owner', s => { s.replicaSets[0].metadata.ownerReferences[0].uid = 'other'; }],
+  ['unready main', s => { s.pods[0].status.containerStatuses[0].ready = false; }],
+  ['failed init', s => { s.pods[0].status.initContainerStatuses[0].state.terminated.exitCode = 1; }],
+  ['changed start time', s => { s.pods[0].status.containerStatuses[0].state.running.startedAt = '2026-09-08T17:10:34Z'; }],
+]) test(`stability refuses ${name} immediately without resetting the baseline`, async () => {
+  const io = stabilityIO(); let count = 0;
+  const observe = () => { const s = io.observe(); if (++count === 2) mutate(s); return s; };
+  await assert.rejects(harness.waitForBootstrap(observe, io.save, io.timing), /bootstrap/);
+  assert.equal(count, 2); // A third clean read must never conceal the failed observation.
+  assert.ok(!io.saved.some(s => s.name === 'crossplane'));
+  assert.ok(io.saved.some(s => s.name === 'crossplane-last-observation'));
+});
+
+test('stability read failure preserves its primary error and still reaches diagnostics and cleanup', async () => {
+  const io = stabilityIO(); const primary = new Error('synthetic bootstrap API failure'); const order = [];
+  let error;
+  try { await harness.waitForBootstrap(() => { if (io.reads) throw primary; return io.observe(); }, io.save, io.timing); }
+  catch (caught) { error = caught; }
+  assert.equal(error, primary);
+  assert.throws(() => finishResult(error, () => order.push('cleanup'), () => {}, {}, () => order.push('diagnostics')), e => e === primary);
+  assert.deepEqual(order, ['diagnostics', 'cleanup']);
+});
+
+test('six-minute overall bootstrap limit includes its stability window', async () => {
+  const io = stabilityIO();
+  const observe = () => { const s = io.observe(); if (io.reads <= 62) s.pods[0].status.containerStatuses[0].ready = false; return s; };
+  await assert.rejects(harness.waitForBootstrap(observe, io.save, io.timing), /bootstrap.*deadline/);
+  assert.ok(!io.saved.some(s => s.name === 'crossplane'));
+});
+
+test('failed observation evidence cannot replace the original bootstrap error', async () => {
+  const io = stabilityIO(); const primary = new Error('bootstrap read failure');
+  await assert.rejects(harness.waitForBootstrap(() => { if (io.reads) throw primary; return io.observe(); }, (name, value) => {
+    if (name === 'crossplane-last-observation') throw new Error('evidence save failed');
+    io.save(name, value);
+  }, io.timing), error => error === primary);
+});
+
+test('readiness may retry only before the first valid stability baseline', async () => {
+  const io = stabilityIO();
+  await harness.waitForBootstrap(() => { const s = io.observe(); if (io.reads === 1) s.activations.push({}); return s; }, io.save, io.timing);
+  assert.equal(io.reads, 14);
+});
+
+for (const [name, now, sleep] of [
+  ['nonfinite clock', () => NaN],
+  ['backward clock', io => -io.reads],
+  ['frozen clock', () => 0, async () => {}],
+  ['sparse observations', io => io.reads * 16_000],
+]) test(`stability refuses ${name}`, async () => {
+  const io = stabilityIO();
+  await assert.rejects(harness.waitForBootstrap(io.observe, io.save, { ...io.timing, now: () => now(io), ...(sleep ? { sleep } : {}) }), /bootstrap/);
+  assert.ok(!io.saved.some(s => s.name === 'crossplane'));
+});
+
+for (const [name, mutate] of [
+  ['missing restart counter', s => { delete s.pods[0].status.containerStatuses[0].restartCount; }],
+  ['negative init counter', s => { s.pods[0].status.initContainerStatuses[0].restartCount = -1; }],
+  ['noninteger counter', s => { s.pods[0].status.containerStatuses[0].restartCount = 0.5; }],
+  ['missing container ID', s => { delete s.pods[0].status.containerStatuses[0].containerID; }],
+  ['blank container ID', s => { s.pods[0].status.containerStatuses[0].containerID = ' '; }],
+  ['missing Pod UID', s => { delete s.pods[0].metadata.uid; }],
+  ['deleting Deployment', s => { s.deployments[0].metadata.deletionTimestamp = '2026-09-08T17:12:00Z'; }],
+  ['missing main start time', s => { delete s.pods[0].status.containerStatuses[0].state.running.startedAt; }],
+  ['invalid main start time', s => { s.pods[0].status.containerStatuses[0].state.running.startedAt = 'never'; }],
+  ['impossible calendar time', s => { s.pods[0].status.containerStatuses[0].state.running.startedAt = '2026-02-30T17:10:33Z'; }],
+  ['missing init finish time', s => { delete s.pods[0].status.initContainerStatuses[0].state.terminated.finishedAt; }],
+  ['reversed init time', s => { s.pods[0].status.initContainerStatuses[0].state.terminated.startedAt = '2026-09-08T17:11:33Z'; }],
+  ['incomplete init', s => { s.pods[0].status.conditions.find(c => c.type === 'Initialized').status = 'False'; }],
+  ['stopped main', s => { s.pods[0].status.containerStatuses[0].state = { terminated: { exitCode: 0 } }; }],
+  ['sidecar init', s => { s.pods[0].spec.initContainers[0].restartPolicy = 'Always'; }],
+]) test(`bootstrap readiness refuses ${name}`, () => {
+  const s = initRetryFixture(); mutate(s); assert.throws(() => assertBootstrap(s), /bootstrap/);
+});
+
 function transport(snapshot = fixture()) {
   const calls = []; const saved = [];
   const io = {
@@ -291,10 +399,10 @@ function transport(snapshot = fixture()) {
   return { io, calls, saved };
 }
 
-test('actual restart fixture remains rejected and captures its bounded evidence before cleanup', () => {
+test('historical restart fixture still captures bounded failure evidence before cleanup', () => {
   const snapshot = fixture(); const t = transport(snapshot); const order = [];
-  assert.throws(() => harness.assertBootstrap(snapshot), /bootstrap proof/);
-  const primary = new Error('original bootstrap refusal');
+  assert.doesNotThrow(() => harness.assertBootstrap(snapshot)); // Readiness alone is no longer a stability proof.
+  const primary = new Error('bootstrap stability failure');
   assert.throws(() => harness.finishResult(primary, () => order.push('cleanup'), (name, value) => {
     t.io.save(name, value); if (name === 'bootstrap-diagnostics') order.push('diagnostics');
   }, {}, () => harness.collectBootstrapDiagnostics(snapshot, {
