@@ -331,7 +331,11 @@ export function assertPolicyManagerReload(before, after) {
     'policy synchronization requires a newly ready package-manager runtime and an unchanged RBAC manager');
 }
 
-export const packageManagerRestartArgs = () => ['rollout', 'restart', 'deployment/crossplane', '-n', 'crossplane-system'];
+export const packageManagerRestartCommand = (kubeconfig, context, cacheDir) => ({
+  executable: 'kubectl',
+  args: ['rollout', 'restart', 'deployment/crossplane', '--namespace', 'crossplane-system',
+    '--kubeconfig', kubeconfig, '--context', context, '--request-timeout=20s', '--cache-dir', cacheDir],
+});
 
 export function assertHealthy(s, ref, generation, baseline) {
   proof(ref === OLD || ref === NEW, 'unapproved package');
@@ -545,7 +549,9 @@ function runner(env) {
         assert.deepEqual(get('imageconfigs.pkg.crossplane.io', policy.metadata.name).spec, policy.spec, 'image policy not stored exactly');
         // Kubernetes readiness follows cache synchronization during controller startup. Replacing the
         // package-manager Pod after the write closes the informer race before a Provider can exist.
-        k(packageManagerRestartArgs());
+        kubeGuard();
+        const restart = packageManagerRestartCommand(kubeconfig, context, path.join(root, 'discovery'));
+        command(restart.executable, restart.args);
         bootstrapSnapshot = await until(`policy-${phase}-loaded`, observeBootstrap,
           after => assertPolicyManagerReload(before, after), 120_000);
       };
