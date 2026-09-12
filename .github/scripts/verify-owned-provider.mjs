@@ -32,6 +32,8 @@ export const positivePolicy = () => ({ apiVersion: 'pkg.crossplane.io/v1beta1', 
 const PROVIDER_NAME = 'github-acceptance';
 const RUNTIME_SERVICE_ACCOUNT = 'github-acceptance-runtime';
 const SAFE_START_ROLE = 'github-acceptance-safe-start';
+const SAFE_START_READ_VERBS = ['get', 'list', 'watch'];
+const SAFE_START_DENIED_VERBS = ['create', 'update', 'patch', 'delete'];
 export const safeStartObjects = () => [
   { apiVersion: 'v1', kind: 'ServiceAccount', metadata: { name: RUNTIME_SERVICE_ACCOUNT, namespace: 'crossplane-system' } },
   { apiVersion: 'rbac.authorization.k8s.io/v1', kind: 'ClusterRole', metadata: { name: SAFE_START_ROLE },
@@ -45,6 +47,13 @@ export const safeStartObjects = () => [
 export const providerManifest = ref => ({ apiVersion: 'pkg.crossplane.io/v1', kind: 'Provider', metadata: { name: PROVIDER_NAME },
   spec: { package: ref, packagePullPolicy: 'IfNotPresent', revisionActivationPolicy: 'Automatic', revisionHistoryLimit: 1,
     runtimeConfigRef: { apiVersion: 'pkg.crossplane.io/v1beta1', kind: 'DeploymentRuntimeConfig', name: PROVIDER_NAME } } });
+export function safeStartPermissionResult(verb, status, output) {
+  const allowed = SAFE_START_READ_VERBS.includes(verb);
+  assert.ok(allowed || SAFE_START_DENIED_VERBS.includes(verb), 'SafeStart permission proof: unsupported verb');
+  assert.equal(status, allowed ? 0 : 1, 'SafeStart permission proof: unexpected kubectl exit status');
+  assert.equal(output.trim(), allowed ? 'yes' : 'no', 'SafeStart permission proof: unexpected kubectl result');
+  return allowed ? 'yes' : 'no';
+}
 const owner = (object, uid) => object.metadata?.ownerReferences?.some(r => r.uid === uid && r.controller === true);
 const conditions = object => object.status?.conditions ?? [];
 const currentTrue = (object, type) => conditions(object).some(c => c.type === type && c.status === 'True' && c.observedGeneration === object.metadata.generation);
@@ -681,11 +690,13 @@ function runner(env) {
         runtimeConfig.spec.serviceAccountTemplate, 'SafeStart runtime ServiceAccount template');
       const safeStartIdentity = `system:serviceaccount:crossplane-system:${RUNTIME_SERVICE_ACCOUNT}`;
       const permissions = {};
-      for (const verb of ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete']) {
+      for (const verb of [...SAFE_START_READ_VERBS, ...SAFE_START_DENIED_VERBS]) {
         kubeGuard();
-        const allowed = command('kubectl', ['auth', 'can-i', verb, 'customresourcedefinitions.apiextensions.k8s.io', '--as', safeStartIdentity,
-          '--kubeconfig', kubeconfig, '--context', context, '--request-timeout=20s', '--cache-dir', path.join(root, 'discovery')]).trim();
-        assert.equal(allowed, ['get', 'list', 'watch'].includes(verb) ? 'yes' : 'no', `SafeStart CRD permission: ${verb}`);
+        const result = spawnSync(executable('kubectl'), ['auth', 'can-i', verb, 'customresourcedefinitions.apiextensions.k8s.io', '--as', safeStartIdentity,
+          '--kubeconfig', kubeconfig, '--context', context, '--request-timeout=20s', '--cache-dir', path.join(root, 'discovery')],
+        { env: runtimeEnv, cwd: root, encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024 });
+        if (result.error) throw new Error('SafeStart permission proof: kubectl execution failed');
+        const allowed = safeStartPermissionResult(verb, result.status, result.stdout);
         permissions[verb] = allowed;
       }
       save('provider-safe-start', { serviceAccount: RUNTIME_SERVICE_ACCOUNT, role: SAFE_START_ROLE, permissions });
