@@ -271,6 +271,96 @@ export function collectBootstrapDiagnostics(snapshot, io) {
   io.save('bootstrap-diagnostics', { namespace, pods: results });
 }
 
+export function collectProviderDiagnostics(snapshot, io) {
+  const scope = ok => assert.ok(ok, 'provider diagnostic scope requires exact owned credential-free runtime');
+  const namespace = 'crossplane-system';
+  const deadline = Date.now() + 45_000;
+  const options = (maxBuffer = 262144) => {
+    const remaining = deadline - Date.now();
+    scope(remaining > 0);
+    return { timeout: Math.min(3000, remaining), maxBuffer };
+  };
+  const provider = snapshot?.provider;
+  scope(provider?.metadata?.name === 'github-acceptance' && provider.metadata.uid
+    && !provider.metadata.deletionTimestamp && snapshot.providerConfigs?.length === 0);
+  const revisions = snapshot.revisions?.filter(revision => revision.spec?.desiredState === 'Active' && owner(revision, provider.metadata.uid));
+  scope(revisions?.length === 1);
+  const revision = revisions[0];
+  const ref = revision.spec.image;
+  scope((ref === OLD || ref === NEW) && revision.metadata.name === provider.status?.currentRevision && revision.metadata.uid);
+  const deployments = snapshot.deployments?.filter(deployment => owner(deployment, revision.metadata.uid));
+  scope(deployments?.length === 1);
+  const deployment = deployments[0];
+  const sets = snapshot.replicaSets?.filter(set => owner(set, deployment.metadata.uid)) ?? [];
+  const pods = snapshot.pods?.filter(pod => !pod.metadata.deletionTimestamp && sets.some(set => owner(pod, set.metadata.uid))) ?? [];
+  scope(pods.length === 1);
+  const pod = pods[0];
+  const set = sets.find(candidate => owner(pod, candidate.metadata.uid));
+  const validate = (currentDeployment, currentSet, currentPod) => {
+    for (const object of [currentDeployment, currentSet, currentPod]) {
+      scope(object?.metadata?.namespace === namespace && object.metadata.uid && object.metadata.name
+        && Number.isSafeInteger(object.metadata.generation) && object.metadata.generation > 0);
+    }
+    scope(owner(currentSet, currentDeployment.metadata.uid) && owner(currentPod, currentSet.metadata.uid)
+      && currentDeployment.metadata.name.startsWith('github-acceptance-')
+      && currentSet.metadata.name.startsWith(`${currentDeployment.metadata.name}-`)
+      && currentPod.metadata.name.startsWith(`${currentSet.metadata.name}-`));
+    const declared = currentDeployment.spec?.template?.spec;
+    const actual = currentPod.spec;
+    scope(declared?.containers?.length === 1 && declared.containers[0].name === 'package-runtime' && declared.containers[0].image === ref
+      && (declared.initContainers ?? []).length === 0 && actual?.containers?.length === 1
+      && actual.containers[0].name === 'package-runtime' && actual.containers[0].image === ref && (actual.initContainers ?? []).length === 0);
+    const states = currentPod.status?.containerStatuses;
+    scope(states?.length === 1 && states[0].name === 'package-runtime' && states[0].ready === true
+      && Number.isSafeInteger(states[0].restartCount) && states[0].restartCount >= 0
+      && typeof states[0].containerID === 'string' && /^[a-z0-9-]+:\/\/[^\s]+$/.test(states[0].containerID)
+      && [ref.split('@')[1], CHILD[ref]].some(digest => states[0].imageID === digest || states[0].imageID?.endsWith(`@${digest}`)));
+    return states[0];
+  };
+  const initialState = validate(deployment, set, pod);
+  const refresh = () => {
+    const current = [deployment, set, pod].map((expected, index) => {
+      const kind = ['Deployment', 'ReplicaSet', 'Pod'][index];
+      const actual = io.read(kind, expected.metadata.name, options());
+      scope(actual.metadata.uid === expected.metadata.uid && actual.metadata.generation === expected.metadata.generation);
+      return actual;
+    });
+    return { objects: current, state: validate(...current) };
+  };
+  const proof = {
+    provider: { name: provider.metadata.name, uid: provider.metadata.uid },
+    revision: { name: revision.metadata.name, uid: revision.metadata.uid, image: ref },
+    deployment: { name: deployment.metadata.name, uid: deployment.metadata.uid },
+    pod: { name: pod.metadata.name, uid: pod.metadata.uid },
+    logs: [],
+  };
+  for (const previous of (initialState.restartCount > 0 ? [true, false] : [false])) {
+    const log = { container: 'package-runtime', previous };
+    try {
+      const before = refresh();
+      const text = io.logs(proof.pod, 'package-runtime', previous, options(32768));
+      const after = refresh();
+      scope(before.state.containerID === after.state.containerID && before.state.restartCount === after.state.restartCount);
+      scope(typeof text === 'string' && Buffer.byteLength(text) <= 16384 && text.replace(/\n$/, '').split('\n').length <= 100);
+      log.text = text;
+    } catch { log.error = 'diagnostic capture unavailable'; }
+    proof.logs.push(log);
+  }
+  try {
+    refresh();
+    const events = io.events(proof.pod, options(65536));
+    refresh();
+    scope(Array.isArray(events) && events.length <= 50);
+    proof.events = events.map(event => {
+      const involved = event.involvedObject;
+      scope(involved?.kind === 'Pod' && involved.namespace === namespace && involved.name === proof.pod.name && involved.uid === proof.pod.uid);
+      return { type: event.type, reason: event.reason, message: String(event.message ?? '').slice(0, 2048), count: event.count,
+        firstTimestamp: event.firstTimestamp, lastTimestamp: event.lastTimestamp };
+    });
+  } catch { proof.eventError = 'diagnostic capture unavailable'; }
+  io.save('provider-runtime-diagnostics', proof);
+}
+
 export function finishResult(primaryError, cleanup, save, details, diagnose = () => {}) {
   let error = primaryError;
   if (error) {
@@ -533,7 +623,7 @@ function runner(env) {
     fs.writeFileSync(path.join(project, 'kind.yaml'), JSON.stringify({ apiVersion: 'kind.x-k8s.io/v1alpha4', kind: 'Cluster', name: cluster,
       networking: { apiServerAddress: '127.0.0.1' }, nodes: [{ role: 'control-plane', image: NODE }] }));
     fs.writeFileSync(path.join(root, 'ownership.json'), JSON.stringify(marker), { mode: 0o600 });
-    let baseline; let primaryError; let bootstrapSnapshot;
+    let baseline; let primaryError; let bootstrapSnapshot; let failureSnapshot;
     try {
       command('ksail', ['cluster', 'create', '--config', config, ...flags], { cwd: project, timeout: 480_000 });
       kubeGuard();
@@ -595,7 +685,7 @@ function runner(env) {
         await until(phase, snapshot, s => assertHealthy(s, ref, generation, baseline));
       }
     } catch (error) {
-      primaryError = error;
+      primaryError = error; failureSnapshot = lastSnapshot;
       save('failure', { message: error.message, ...marker });
       if (baseline) {
         try {
@@ -610,13 +700,16 @@ function runner(env) {
       kubeGuard({ timeout: 3000, maxBuffer: 65536 });
       const diagnostic = (args, options) => command('kubectl', [...args, '--namespace', 'crossplane-system', '--kubeconfig', kubeconfig,
         '--context', context, '--request-timeout=2s', '--cache-dir', path.join(root, 'discovery')], { ...options, privateInput: true });
-      collectBootstrapDiagnostics(bootstrapSnapshot, {
+      const diagnosticIO = {
         read: (kind, name, options) => JSON.parse(diagnostic(['get', kind, name, '-o', 'json'], options)),
         logs: (pod, container, previous, options) => diagnostic(['logs', pod.name, '--container', container, `--previous=${previous}`,
           '--tail=100', '--limit-bytes=16384', '--timestamps=true', '--pod-running-timeout=2s'], options),
         events: (pod, options) => JSON.parse(diagnostic(['get', 'events', '--field-selector', `involvedObject.uid=${pod.uid}`, '-o', 'json'], options)).items,
         save,
-      });
+      };
+      collectBootstrapDiagnostics(bootstrapSnapshot, diagnosticIO);
+      try { collectProviderDiagnostics(failureSnapshot, diagnosticIO); }
+      catch { save('provider-runtime-diagnostic-unavailable', { message: 'provider runtime diagnostic capture unavailable' }); }
     });
   };
   return { run, cleanup };

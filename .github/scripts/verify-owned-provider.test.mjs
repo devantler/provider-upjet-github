@@ -470,6 +470,65 @@ test('historical restart fixture still captures bounded failure evidence before 
   assert.ok(t.calls.every(c => c.options.timeout > 0 && c.options.timeout <= 3000 && c.options.maxBuffer <= 262144));
 });
 
+function providerDiagnosticFixture() {
+  const snapshot = healthyFixture();
+  Object.assign(snapshot.deployments[0].metadata, { name: 'github-acceptance-revision', namespace: 'crossplane-system' });
+  Object.assign(snapshot.replicaSets[0].metadata, { name: 'github-acceptance-revision-rs', namespace: 'crossplane-system', generation: 1 });
+  Object.assign(snapshot.pods[0].metadata, { name: 'github-acceptance-revision-rs-pod', namespace: 'crossplane-system', generation: 1 });
+  snapshot.pods[0].status.containerStatuses[0] = {
+    name: 'package-runtime', ready: true, restartCount: 1,
+    containerID: 'containerd://current', imageID: `docker-pullable://${old}`,
+    state: { running: { startedAt: '2026-09-12T10:45:51Z' } },
+    lastState: { terminated: { containerID: 'containerd://previous', exitCode: 1, reason: 'Error', startedAt: '2026-09-12T10:45:44Z', finishedAt: '2026-09-12T10:45:50Z' } },
+  };
+  return snapshot;
+}
+
+function providerTransport(snapshot) {
+  const calls = []; const saved = [];
+  return { calls, saved, io: {
+    read(kind, name, options) {
+      calls.push({ kind, name, options });
+      const key = { Deployment: 'deployments', ReplicaSet: 'replicaSets', Pod: 'pods' }[kind];
+      const value = snapshot[key]?.find(object => object.metadata.name === name);
+      assert.ok(value, 'unexpected provider diagnostic read target');
+      return structuredClone(value);
+    },
+    logs(pod, container, previous, options) {
+      calls.push({ log: true, pod, container, previous, options });
+      return previous ? '2026-09-12T10:45:50Z previous provider failure\n' : '2026-09-12T10:45:51Z provider recovered\n';
+    },
+    events(pod, options) {
+      calls.push({ event: true, pod, options });
+      return [{ involvedObject: { kind: 'Pod', namespace: 'crossplane-system', name: pod.name, uid: pod.uid },
+        type: 'Warning', reason: 'BackOff', message: 'Synthetic provider runtime event.' }];
+    },
+    save(name, value) { saved.push({ name, value }); },
+  } };
+}
+
+test('provider failure diagnostics capture only the exact owned runtime and its previous logs', () => {
+  const snapshot = providerDiagnosticFixture(); const transport = providerTransport(snapshot);
+  harness.collectProviderDiagnostics(snapshot, transport.io);
+  const proof = transport.saved.find(item => item.name === 'provider-runtime-diagnostics').value;
+  assert.equal(proof.pod.name, snapshot.pods[0].metadata.name);
+  assert.deepEqual(proof.logs.map(log => log.previous), [true, false]);
+  assert.match(proof.logs[0].text, /previous provider failure/);
+  assert.equal(proof.events.length, 1);
+  assert.ok(transport.calls.every(call => call.options.timeout > 0 && call.options.timeout <= 3000 && call.options.maxBuffer <= 262144));
+});
+
+for (const [name, change] of [
+  ['credential configuration exists', snapshot => snapshot.providerConfigs.push({})],
+  ['foreign runtime namespace', snapshot => { snapshot.pods[0].metadata.namespace = 'other'; }],
+  ['foreign revision owner', snapshot => { snapshot.revisions[0].metadata.ownerReferences[0].uid = 'other'; }],
+  ['unapproved runtime image', snapshot => { snapshot.pods[0].spec.containers[0].image = image; }],
+]) test(`provider diagnostics refuse ${name} before log access`, () => {
+  const snapshot = providerDiagnosticFixture(); change(snapshot); const transport = providerTransport(snapshot);
+  assert.throws(() => harness.collectProviderDiagnostics(snapshot, transport.io), /provider diagnostic scope/);
+  assert.equal(transport.calls.filter(call => call.log || call.event).length, 0);
+});
+
 test('diagnostic and diagnostic-save failures cannot hide the primary failure or prevent cleanup', () => {
   const primary = new Error('original failure'); const order = [];
   assert.throws(() => harness.finishResult(primary, () => order.push('cleanup'), (name, value) => {
